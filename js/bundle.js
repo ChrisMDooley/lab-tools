@@ -1,0 +1,179 @@
+/* ============================================================================
+   bundle.js  -  experiments as self-describing folders on disk.
+
+   The principle the whole platform rests on: FILES ARE THE SOURCE OF TRUTH.
+   Any index or database is derived and can be thrown away and rebuilt. So a
+   bundle has to be readable in ten years without this code:
+
+     experiments/<ID>/
+       experiment.json      the record itself
+       manifest.json        SHA-256 of every file, so corruption is visible
+       raw/                 instrument files exactly as they came off the machine
+       figures/             generated output
+       exports/             what was sent elsewhere, e.g. to the ELN
+       .lock.json           present only while someone has it open
+
+   Written against the VFS interface, never the browser API, so all of this is
+   exercised by the test suite against an in-memory filesystem.
+
+   Exposes a global: BUNDLE
+   ========================================================================= */
+var BUNDLE = (function(){
+  "use strict";
+
+  const FORMAT = "lab-tools/bundle-1";
+  const ROOT = "experiments";
+  const LOCK_STALE_MS = 2 * 60 * 60 * 1000;      // a lock older than this is ignored
+
+  const enc = s => new TextEncoder().encode(s);
+  const hex = buf => [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,"0")).join("");
+
+  async function sha256(data){
+    const bytes = data instanceof Uint8Array ? data : enc(String(data));
+    const c = (typeof crypto !== "undefined" && crypto.subtle) ? crypto.subtle : null;
+    if(!c) throw new Error("No WebCrypto in this context - checksums need a secure context (https or localhost).");
+    // Copy into a fresh buffer: a Uint8Array view over a larger buffer would
+    // otherwise hash the whole buffer, which is a nasty silent bug.
+    return hex(await c.digest("SHA-256", bytes.slice().buffer));
+  }
+
+  const dir = id => ROOT + "/" + id;
+  const idOf = name => String(name).replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "") || "experiment";
+
+  /* ---- listing ----------------------------------------------------------- */
+  async function list(vfs){
+    const out = [];
+    for(const e of await vfs.listDir(ROOT)){
+      if(e.kind !== "directory") continue;
+      const rec = { id:e.name, name:e.name, modified:null, ok:null, locked:false };
+      try{
+        const x = await VFS.readJSON(vfs, dir(e.name) + "/experiment.json");
+        rec.name = (x.meta && x.meta.name) || e.name;
+        rec.researcher = x.meta && x.meta.researcher;
+        rec.kind = x.kind || "experiment";
+      }catch(err){ rec.unreadable = String(err.message || err); }
+      try{
+        const m = await VFS.readJSON(vfs, dir(e.name) + "/manifest.json");
+        rec.modified = m.written || null; rec.files = (m.files||[]).length;
+      }catch(err){}
+      rec.locked = !!(await lockState(vfs, e.name)).held;
+      out.push(rec);
+    }
+    return out.sort((a,b)=>String(b.modified||"").localeCompare(String(a.modified||"")));
+  }
+
+  /* ---- writing ----------------------------------------------------------- */
+  /* extras: [{path:"raw/x.eds", data:Uint8Array|string}] written verbatim.
+     The manifest is built from what is actually on disk afterwards, not from
+     what we intended to write, so it cannot drift from reality. */
+  async function save(vfs, experiment, opts){
+    const o = Object.assign({ extras:[], appVersion:"", id:null }, opts||{});
+    const id = o.id || idOf((experiment.meta && (experiment.meta.id || experiment.meta.name)) || "experiment");
+    const base = dir(id);
+    await VFS.writeJSON(vfs, base + "/experiment.json", experiment);
+    for(const f of o.extras) await vfs.writeFile(base + "/" + f.path, f.data);
+    const files = [];
+    await walk(vfs, base, "", files);
+    const manifest = {
+      format: FORMAT, id,
+      written: new Date().toISOString(),
+      appVersion: o.appVersion || "",
+      files: []
+    };
+    for(const rel of files.sort()){
+      if(rel === "manifest.json" || rel === ".lock.json") continue;
+      const bytes = await vfs.readFile(base + "/" + rel);
+      manifest.files.push({ path:rel, bytes:bytes.length, sha256:await sha256(bytes) });
+    }
+    await VFS.writeJSON(vfs, base + "/manifest.json", manifest);
+    return { id, manifest };
+  }
+  async function walk(vfs, base, rel, out){
+    for(const e of await vfs.listDir(rel ? base + "/" + rel : base)){
+      const r = rel ? rel + "/" + e.name : e.name;
+      if(e.kind === "directory") await walk(vfs, base, r, out);
+      else out.push(r);
+    }
+  }
+
+  /* ---- reading and verifying --------------------------------------------- */
+  async function load(vfs, id){
+    const base = dir(id);
+    const experiment = await VFS.readJSON(vfs, base + "/experiment.json");
+    let manifest = null, verification = { checked:false };
+    try{ manifest = await VFS.readJSON(vfs, base + "/manifest.json"); }catch(e){}
+    if(manifest) verification = await verify(vfs, id, manifest);
+    return { id, experiment, manifest, verification };
+  }
+
+  /* Recompute every hash. A bundle that has been edited outside the app, or
+     half-copied, says so instead of being silently trusted. */
+  async function verify(vfs, id, manifest){
+    const base = dir(id);
+    if(!manifest){
+      try{ manifest = await VFS.readJSON(vfs, base + "/manifest.json"); }
+      catch(e){ return { checked:false, ok:false, reason:"no manifest" }; }
+    }
+    const changed = [], missing = [];
+    for(const f of (manifest.files||[])){
+      let bytes;
+      try{ bytes = await vfs.readFile(base + "/" + f.path); }
+      catch(e){ missing.push(f.path); continue; }
+      const h = await sha256(bytes);
+      if(h !== f.sha256) changed.push({ path:f.path, expected:f.sha256, actual:h });
+    }
+    const onDisk = [];
+    await walk(vfs, base, "", onDisk);
+    const known = new Set((manifest.files||[]).map(f=>f.path));
+    const added = onDisk.filter(p => p !== "manifest.json" && p !== ".lock.json" && !known.has(p));
+    return { checked:true, ok: !changed.length && !missing.length && !added.length,
+             changed, missing, added, written: manifest.written, count:(manifest.files||[]).length };
+  }
+
+  /* ---- locking ------------------------------------------------------------
+     A shared folder gives multi-user for free, but not concurrent editing.
+     Two people saving the same experiment means last-writer-wins and silent
+     loss, so a lock file makes the collision visible. This is advisory - a
+     convention between copies of this app, not enforcement. It is honest
+     about that rather than pretending to be a transaction. */
+  async function lockState(vfs, id){
+    const p = dir(id) + "/.lock.json";
+    try{
+      const l = await VFS.readJSON(vfs, p);
+      const age = Date.now() - new Date(l.acquired).getTime();
+      return { held: age < LOCK_STALE_MS, stale: age >= LOCK_STALE_MS, lock:l, ageMs:age };
+    }catch(e){ return { held:false, stale:false, lock:null, ageMs:null }; }
+  }
+  async function lock(vfs, id, owner){
+    const st = await lockState(vfs, id);
+    if(st.held && st.lock.owner !== owner)
+      return { ok:false, reason:"held by " + st.lock.owner, lock:st.lock };
+    const l = { owner: owner || "unknown", acquired: new Date().toISOString(),
+                app: "lab-tools" };
+    await VFS.writeJSON(vfs, dir(id) + "/.lock.json", l);
+    return { ok:true, lock:l };
+  }
+  async function unlock(vfs, id, owner){
+    const st = await lockState(vfs, id);
+    if(st.lock && owner && st.lock.owner !== owner) return { ok:false, reason:"not yours" };
+    try{ await vfs.remove(dir(id) + "/.lock.json"); }catch(e){}
+    return { ok:true };
+  }
+
+  /* ---- export for the ELN -------------------------------------------------
+     A single self-contained JSON carrying the record and the manifest, so the
+     provenance copy in Labfolder is checkable against the folder on disk. */
+  async function exportBundle(vfs, id){
+    const { experiment, manifest } = await load(vfs, id);
+    return { format:"lab-tools/export-1", id,
+             exported:new Date().toISOString(), experiment, manifest };
+  }
+  async function addFile(vfs, id, relPath, data){
+    await vfs.writeFile(dir(id) + "/" + relPath, data);
+  }
+
+  return { FORMAT, ROOT, LOCK_STALE_MS, sha256, idOf, dir,
+           list, save, load, verify, lock, unlock, lockState,
+           exportBundle, addFile };
+})();
+if (typeof module !== "undefined") module.exports = BUNDLE;

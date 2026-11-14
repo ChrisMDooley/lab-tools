@@ -254,6 +254,16 @@ code{font-family:var(--mono);font-size:11.5px;background:#f0efec;padding:1px 4px
         keep independent calculation settings, so no single value is forced here.</div>
     </div></div>
 
+    <div class="panel" id="wsCard" style="display:none"><div class="t">Workspace
+      <div class="r"><label style="display:flex;align-items:center;gap:6px">
+        <span class="hint">you</span>
+        <input id="who" placeholder="your name" style="width:150px" oninput="WS.setOwner(this.value)">
+      </label></div></div>
+      <div class="b"><div id="wsPanel"></div><div id="wsList"></div>
+        <div class="btns" style="margin-top:10px">
+          <button class="p" onclick="wsSave()" id="wsSaveBtn">Save experiment to folder</button>
+        </div></div></div>
+
     <div class="panel"><div class="t">Global calculation settings</div><div class="b">
       <div class="grid g5">
         <label><i>Excess <em>%</em></i><input id="g_exc" type="number" step="0.5"></label>
@@ -515,6 +525,11 @@ code{font-family:var(--mono);font-size:11.5px;background:#f0efec;padding:1px 4px
   </main>
 </div>
 
+<!-- Optional. Present in the repo, absent if index.html is used on its own;
+     the planner degrades to import/export and everything else still works. -->
+<script src="js/vfs.js"></script>
+<script src="js/bundle.js"></script>
+<script src="js/workspace.js"></script>
 <script>
 "use strict";
 /* ========================================================================
@@ -1678,6 +1693,76 @@ function renderTests(){
 }
 
 /* ========================================================================
+   WORKSPACE  -  optional. Only active when js/workspace.js is alongside.
+   ======================================================================== */
+const HAS_WS = typeof WS !== "undefined" && typeof BUNDLE !== "undefined";
+if(HAS_WS){
+  WS._connect    = async () => { try{ await WS.connect(); }catch(e){ alert(e.message); } };
+  WS._grant      = async () => { const r = await WS.grant();
+    if(r.state!=="connected") alert("Permission was not granted."); };
+  WS._disconnect = async () => { if(confirm("Disconnect the data folder? Nothing on disk is deleted."))
+    await WS.disconnect(); };
+  WS._refresh    = () => wsDraw();
+}
+async function wsDraw(state){
+  if(!HAS_WS) return;
+  const card = document.getElementById("wsCard"); card.style.display = "block";
+  document.getElementById("wsPanel").innerHTML = WS.panelHTML(state);
+  document.getElementById("wsSaveBtn").disabled = !WS.connected();
+  const el = document.getElementById("wsList");
+  if(!WS.connected()){ el.innerHTML=""; return; }
+  let xs; try{ xs = await WS.listExperiments(); }
+  catch(e){ el.innerHTML = `<div class="note e">Could not read the folder: ${esc(e.message)}</div>`; return; }
+  const mine = xs.filter(x=>x.kind!=="qpcr");
+  el.innerHTML = !xs.length ? `<div class="hint" style="margin-top:9px">No experiments here yet.</div>`
+    : `<div class="scroll" style="margin-top:11px"><table><thead><tr><th>Experiment</th><th>Kind</th>
+       <th class="n">Files</th><th>Written</th><th>State</th><th></th></tr></thead><tbody>` +
+      xs.map(x=>`<tr><td><b>${esc(x.name)}</b><div class="hint num">${esc(x.id)}</div></td>
+        <td class="hint">${esc(x.kind||"")}</td><td class="n">${x.files==null?"":x.files}</td>
+        <td class="hint">${x.modified?new Date(x.modified).toLocaleString():"&mdash;"}</td>
+        <td>${x.locked?'<span class="tag w">open elsewhere</span>':""}</td>
+        <td>${x.kind==="qpcr"?'<span class="hint">qPCR run</span>'
+             :`<button onclick="wsOpen('${esc(x.id)}')">Open</button>`}</td></tr>`).join("") +
+      `</tbody></table></div>`;
+}
+/* The oligo library lives in the data folder, so the whole lab shares one. */
+async function wsSyncLibrary(){
+  if(!HAS_WS || !WS.connected()) return;
+  const lib = await WS.readLibrary();
+  if(lib && Array.isArray(lib) && lib.length && !LIB.length) setLibrary(lib);
+}
+async function wsSave(){
+  if(!WS.connected()){ alert("Connect a data folder first."); return; }
+  if(!WS.owner()){
+    const who = prompt("Your name, so colleagues know who has an experiment open:");
+    if(!who) return; WS.setOwner(who); document.getElementById("who").value = who;
+  }
+  if(!S.meta.name && !S.meta.id){ alert("Give the experiment a name or ID first."); return; }
+  const btn = document.getElementById("wsSaveBtn");
+  btn.disabled = true; btn.textContent = "Saving...";
+  try{
+    const record = Object.assign({ kind:"transfection", format:"lab-tools/transfection-1" },
+      JSON.parse(JSON.stringify(S)));
+    const r = await WS.saveExperiment(record, { appVersion:"phase-b" });
+    if(!r.ok){ alert(r.reason+"\n\nNothing was written."); return; }
+    if(LIB.length) try{ await WS.writeLibrary(LIB); }catch(e){}
+    await wsDraw();
+  }catch(e){ alert("Save failed: "+e.message); }
+  finally{ btn.disabled=false; btn.textContent="Save experiment to folder"; }
+}
+async function wsOpen(id){
+  try{
+    const { experiment, verification } = await WS.openExperiment(id);
+    if(verification && verification.checked && !verification.ok &&
+       !confirm("This bundle no longer matches its checksums - it has been changed outside the app.\n\nOpen it anyway?"))
+      return;
+    if(!experiment.plates) throw new Error("not a transfection experiment");
+    S = experiment; S.settings = Object.assign(defaults(), S.settings||{});
+    S.active = 0; sel.clear(); save(); renderAll(); await wsDraw();
+  }catch(e){ alert("Could not open: "+e.message); }
+}
+
+/* ========================================================================
    BOOT
    ======================================================================== */
 document.querySelectorAll("#nav a").forEach(a=>{
@@ -1693,6 +1778,11 @@ loadLibraryFromStore();
 if(!load()) loadExample();
 bindMeta(); bindPlateProps(); bindCalc();
 renderAll(); renderAssignOptions(); wireLibDrop(); autoLoadLibrary();
+if(HAS_WS){
+  document.getElementById("who").value = WS.owner();
+  WS.onChange(()=>{ wsDraw(); wsSyncLibrary(); });
+  WS.restore().then(st=>{ wsDraw(st); wsSyncLibrary(); }).catch(()=>wsDraw());
+}
 </script>
 </body>
 </html>

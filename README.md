@@ -53,6 +53,50 @@ the File System Access API, which **Firefox and Safari do not support**. Chrome 
 
 ---
 
+## Workspace: experiments as folders
+
+Point either page at a data folder and experiments are written there as **self-describing
+bundles** you can read in ten years without this code:
+
+```
+<your data folder>/
+  oligos.json                     local library, shared by both pages
+  experiments/
+    EXP-TX-1/
+      experiment.json             the record
+      manifest.json               SHA-256 of every file
+      raw/      plate3.eds        instrument files, byte for byte as they came off the machine
+      figures/  rq.svg  refgene.svg
+      exports/  results.csv
+      .lock.json                  present only while someone has it open
+```
+
+**Files are the source of truth.** Any index or database built later is derived and can be
+thrown away and rebuilt. Losing it is an inconvenience; losing the folder is not a risk you take
+in the first place, because it is wherever your institute already backs up.
+
+- **Checksums.** Every file is hashed on save. *Verify* recomputes them and reports anything
+  edited, deleted or added outside the app, rather than trusting the folder silently.
+- **Point it at a shared drive and the lab shares it** — the institute supplies authentication,
+  backup and jurisdiction, and there is no server to run.
+- **Locking is advisory.** A `.lock.json` makes a collision visible and names who holds it; a
+  lock older than two hours is treated as abandoned. This is a convention between copies of this
+  app, not a transaction, and it does not pretend otherwise.
+- The folder is chosen once and remembered. Browsers still ask permission each session — one
+  click, not another trip through the picker.
+
+### Browser requirement
+
+Folder mode needs the **File System Access API**: Chrome or Edge. Firefox and Safari have both
+declined to implement it. Without it the pages fall back to manual import and export, which
+works everywhere.
+
+`index.html` also still works **on its own**, with no `js/` folder beside it — it simply has no
+folder mode. That is deliberate: a tool a student emails to a colleague should not break on
+arrival.
+
+---
+
 ## Sequences are not in this repository
 
 **`oligos.json` is deliberately absent and is listed in `.gitignore`.**

@@ -23,6 +23,13 @@
        is uploaded anywhere. Relative quantification by the Livak method, with the reference gene
        and calibrator under your control and every excluded reaction accounted for.</p></div>
 
+  <div class="panel"><div class="t">Workspace
+    <div class="r"><label style="display:flex;align-items:center;gap:6px">
+      <span class="hint">you</span>
+      <input id="who" placeholder="your name" style="width:150px" oninput="WS.setOwner(this.value)">
+    </label></div></div>
+    <div class="b"><div id="wsPanel"></div><div id="wsList"></div></div></div>
+
   <div class="panel"><div class="t">Plates
     <div class="r">
       <button onclick="document.getElementById('f').click()">Add .eds files</button>
@@ -61,6 +68,9 @@
     <div class="b"><div id="tests"></div></div></div>
 </main>
 
+<script src="js/vfs.js"></script>
+<script src="js/bundle.js"></script>
+<script src="js/workspace.js"></script>
 <script src="js/eds.js"></script>
 <script src="js/ddct.js"></script>
 <script src="js/fig.js"></script>
@@ -89,6 +99,7 @@ async function load(files){
       const t0 = performance.now();
       const d = await EDS.parseFile(f);
       d.ms = Math.round(performance.now()-t0);
+      d.file = f;   // a File is a disk-backed handle, so this costs nothing until read
       if(PLATES.some(p=>p.filename===d.filename)){
         if(!confirm(d.filename+" is already loaded. Add it again?")) continue;
       }
@@ -172,6 +183,7 @@ function renderOut(){
         <button onclick="dl('csv')">CSV</button>
         <button onclick="dl('svg')">SVG</button>
         <button onclick="dl('png')">PNG</button>
+        <button class="p" onclick="saveRun()" id="saveBtn">Save to workspace</button>
       </div></div>
       <div class="b"><div class="figwrap">${chart}</div></div></div>
      <div class="panel"><div class="t">Reference gene
@@ -252,6 +264,98 @@ async function dl(kind){
   catch(e){ alert("PNG export failed: "+e.message+"\nThe SVG export always works."); }
 }
 
+/* ---------- workspace --------------------------------------------------- */
+WS._connect    = async () => { try{ await WS.connect(); }catch(e){ alert(e.message); } };
+WS._grant      = async () => { const r = await WS.grant();
+  if(r.state!=="connected") alert("Permission was not granted."); };
+WS._disconnect = async () => { if(confirm("Disconnect the data folder? Nothing on disk is deleted."))
+  await WS.disconnect(); };
+WS._refresh    = () => drawWorkspace();
+
+async function drawWorkspace(state){
+  document.getElementById("wsPanel").innerHTML = WS.panelHTML(state);
+  const el = document.getElementById("wsList");
+  const btn = document.getElementById("saveBtn");
+  if(btn) btn.disabled = !WS.connected();
+  if(!WS.connected()){ el.innerHTML = ""; return; }
+  let xs;
+  try{ xs = await WS.listExperiments(); }
+  catch(e){ el.innerHTML = `<div class="note e">Could not read the folder: ${esc(e.message)}</div>`; return; }
+  if(!xs.length){ el.innerHTML = `<div class="hint" style="margin-top:9px">No experiments in this
+    folder yet. Analyse some plates and save.</div>`; return; }
+  el.innerHTML = `<div class="scroll" style="margin-top:11px"><table><thead><tr><th>Experiment</th>
+    <th>Kind</th><th class="n">Files</th><th>Written</th><th>State</th><th></th></tr></thead><tbody>` +
+    xs.map(x=>`<tr><td><b>${esc(x.name)}</b><div class="hint num">${esc(x.id)}</div></td>
+      <td class="hint">${esc(x.kind||"")}</td><td class="n">${x.files==null?"":x.files}</td>
+      <td class="hint">${x.modified?new Date(x.modified).toLocaleString():"&mdash;"}</td>
+      <td>${x.unreadable?'<span class="tag e">unreadable</span>':""}
+          ${x.locked?'<span class="tag w">open elsewhere</span>':""}</td>
+      <td><button onclick="checkBundle('${esc(x.id)}')">Verify</button></td></tr>`).join("") +
+    `</tbody></table></div><div id="vres"></div>`;
+}
+async function checkBundle(id){
+  const v = await WS.verifyExperiment(id);
+  const d = document.getElementById("vres");
+  if(!v.checked){ d.innerHTML = `<div class="note w"><b>${esc(id)}</b>: no manifest, so nothing to check against.</div>`; return; }
+  d.innerHTML = v.ok
+    ? `<div class="note k"><b>${esc(id)}</b>: all ${v.count} files match their checksums.</div>`
+    : `<div class="note e"><b>${esc(id)}</b> has changed since it was written.
+       ${v.changed.length?`<br>${v.changed.length} file(s) edited: ${v.changed.map(c=>esc(c.path)).join(", ")}`:""}
+       ${v.missing.length?`<br>${v.missing.length} missing: ${v.missing.map(esc).join(", ")}`:""}
+       ${v.added.length?`<br>${v.added.length} added outside the manifest: ${v.added.map(esc).join(", ")}`:""}
+       </div>`;
+}
+
+/* Save the analysis as a bundle: the record, the raw instrument files exactly
+   as they came off the machine, the figures, and the results as CSV. */
+async function saveRun(){
+  if(!A) return;
+  if(!WS.connected()){ alert("Connect a data folder first."); return; }
+  if(!WS.owner()){
+    const who = prompt("Your name, so colleagues know who has an experiment open:");
+    if(!who) return; WS.setOwner(who); document.getElementById("who").value = who;
+  }
+  const suggested = (PLATES[0]?PLATES[0].filename.replace(/\.eds$/i,""):"qpcr-run");
+  const name = prompt("Save as:", suggested);
+  if(!name) return;
+  const btn = document.getElementById("saveBtn");
+  btn.disabled = true; btn.textContent = "Saving...";
+  try{
+    const extras = [];
+    for(const p of PLATES) if(p.file)
+      extras.push({ path:"raw/"+p.file.name, data:new Uint8Array(await p.file.arrayBuffer()) });
+    extras.push({ path:"figures/rq.svg",
+      data: FIG.rqChart(A,{title:"Relative quantity vs "+A.calibrator,
+        subtitle:"normalised to "+A.refTarget, width:1060}) });
+    extras.push({ path:"figures/refgene.svg",
+      data: FIG.refChart(A,{title:"Reference-gene stability", width:1060}) });
+    extras.push({ path:"exports/results.csv", data: DDCT.toCSV(A) });
+    const record = {
+      kind:"qpcr", format:"lab-tools/qpcr-1",
+      meta:{ id:BUNDLE.idOf(name), name, researcher:WS.owner(),
+             analysed:new Date().toISOString() },
+      analysis:{ refTarget:A.refTarget, calibrator:A.calibrator,
+                 minCqConf:A.options.minCqConf, maxCq:A.options.maxCq,
+                 plates:PLATES.map(p=>({ filename:p.filename, block:p.block, wells:p.wells,
+                                         targets:p.targets, endo:p.endo })) },
+      results: DDCT.table(A).map(v=>({ group:v.group, target:v.target, rq:v.rq,
+                 lo:v.lo, hi:v.hi, n:v.n, reps:v.reps, meanCq:v.cq })),
+      qc:{ excluded:A.nDropped,
+           reasons:[...A.drops.entries()].map(([why,l])=>({ why, n:l.length })),
+           referenceGene:A.refStats },
+      warnings: A.warnings
+    };
+    const r = await WS.saveExperiment(record, { extras, appVersion:"phase-b" });
+    if(!r.ok){ alert(r.reason + "\n\nNothing was written."); return; }
+    await drawWorkspace();
+    document.getElementById("vres").innerHTML =
+      `<div class="note k">Saved <b>${esc(r.id)}</b> \u2014 ${r.manifest.files.length} files,
+       each checksummed. The raw .eds files are in <code>raw/</code>, so the analysis can always
+       be reproduced from what is in the folder.</div>`;
+  }catch(e){ alert("Save failed: "+e.message); }
+  finally{ btn.disabled=false; btn.textContent="Save to workspace"; }
+}
+
 /* ---------- validation ------------------------------------------------- */
 function runTests(){
   const T=[], ok=(name,cond,detail)=>T.push({name,pass:!!cond,detail:detail||""});
@@ -310,8 +414,50 @@ function runTests(){
   }
   return T;
 }
-function renderTests(){
-  const T=runTests(), pass=T.filter(t=>t.pass).length;
+async function bundleTests(){
+  const T=[], ok=(name,cond,detail)=>T.push({name,pass:!!cond,detail:detail||""});
+  /* These run against an in-memory filesystem. Stash whatever is really
+     connected and put it back afterwards, or running the self-test would
+     quietly detach the user's data folder. */
+  const prevVfs = WS.current(), prevOwner = WS.owner();
+  try{
+    const mem = VFS.memory();
+    const rec = { kind:"qpcr", meta:{ id:"TEST-1", name:"self test" }, results:[] };
+    const r = await BUNDLE.save(mem, rec, { extras:[
+      { path:"raw/a.eds", data:new Uint8Array([1,2,3]) },
+      { path:"figures/f.svg", data:"<svg/>" } ] });
+    ok("Bundle writes the record, raw files and figures", r.manifest.files.length===3,
+       r.manifest.files.map(f=>f.path).join(", "));
+    ok("Every file is checksummed", r.manifest.files.every(f=>/^[0-9a-f]{64}$/.test(f.sha256)));
+    ok("A freshly written bundle verifies", (await BUNDLE.verify(mem,"TEST-1")).ok);
+    await mem.writeFile("experiments/TEST-1/figures/f.svg","<svg>tampered</svg>");
+    const v = await BUNDLE.verify(mem,"TEST-1");
+    ok("Editing a file outside the app is detected",
+       !v.ok && v.changed.some(c=>c.path==="figures/f.svg"));
+    ok("Locking refuses a second owner and names the first",
+       (await BUNDLE.lock(mem,"TEST-1","a")).ok &&
+       !(await BUNDLE.lock(mem,"TEST-1","b")).ok);
+    ok("Round-trip through the workspace preserves the record", await (async()=>{
+      const m2 = VFS.memory(); WS._use(m2);
+      await WS.saveExperiment(rec,{takeLock:false});
+      const back = await WS.openExperiment("TEST-1");
+      return JSON.stringify(back.experiment)===JSON.stringify(rec);
+    })());
+    ok("A conflicting save is refused rather than overwriting", await (async()=>{
+      const m3 = VFS.memory(); WS._use(m3);
+      const keep = WS.owner(); WS.setOwner("alice");
+      await WS.saveExperiment(rec,{});
+      WS.setOwner("bob");
+      const r2 = await WS.saveExperiment(rec,{});
+      WS.setOwner(keep);
+      return r2.ok===false && r2.conflict===true;
+    })());
+  }catch(e){ ok("Bundle tests ran", false, e.message); }
+  finally{ WS._use(prevVfs); WS.setOwner(prevOwner); }
+  return T;
+}
+async function renderTests(){
+  const T=runTests().concat(await bundleTests()), pass=T.filter(t=>t.pass).length;
   const parity = T.some(t=>/^Parity/.test(t.name));
   document.getElementById("tests").innerHTML =
     `<div class="note ${pass===T.length?"k":"e"}"><b>${pass} of ${T.length} checks pass.</b>
@@ -333,6 +479,9 @@ if(!("DecompressionStream" in window)){
      <code>DecompressionStream</code>, which is needed to decompress the archive. Use a recent
      Chrome or Edge.</div>`;
 }
+document.getElementById("who").value = WS.owner();
+WS.onChange(()=>drawWorkspace());
+WS.restore().then(drawWorkspace).catch(()=>drawWorkspace());
 stats(); renderTests();
 </script>
 </body>
