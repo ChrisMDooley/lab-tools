@@ -1,0 +1,29 @@
+[
+  {
+    "name": "SC_demo",
+    "label": "scrambled control",
+    "chemistry": "steric",
+    "stockConc": 400,
+    "stockUnit": "µM",
+    "seq": "ACGTACGTACGTACGTAC",
+    "notes": "FICTIONAL - template only"
+  },
+  {
+    "name": "Oligo_A",
+    "label": "exon N, 3' acceptor",
+    "chemistry": "exon-skipping",
+    "stockConc": 400,
+    "stockUnit": "µM",
+    "seq": "GGTTACCTGATTACGGTA",
+    "notes": "FICTIONAL - template only"
+  },
+  {
+    "name": "Gapmer_demo",
+    "label": "internal",
+    "chemistry": "gapmer",
+    "stockConc": 400,
+    "stockUnit": "µM",
+    "seq": "TTACGGCATTACGGCATT",
+    "notes": "FICTIONAL - template only"
+  }
+]

@@ -1,0 +1,14 @@
+window.LAB_PARITY = {
+  "refTarget": "REF_GENE",
+  "calibrator": "CONTROL_GROUP",
+  "minCqConf": 0.5,
+  "note": "FICTIONAL template. Copy to validation.json and fill in real values; that file is gitignored.",
+  "expect": [
+    {
+      "group": "TREATED_GROUP",
+      "target": "TARGET_1",
+      "rq": 2.0,
+      "tol": 0.001
+    }
+  ]
+};

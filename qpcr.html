@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qPCR Analysis</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<div id="top">
+  <h1>DMD Lab</h1>
+  <nav>
+    <a href="index.html">Transfection</a>
+    <a href="qpcr.html" class="on">qPCR Analysis</a>
+  </nav>
+  <div id="stats"></div>
+</div>
+
+<main>
+  <div class="hd"><h2>qPCR Analysis</h2>
+    <p>Drop QuantStudio <code>.eds</code> files in. They are read here in the browser &mdash; nothing
+       is uploaded anywhere. Relative quantification by the Livak method, with the reference gene
+       and calibrator under your control and every excluded reaction accounted for.</p></div>
+
+  <div class="panel"><div class="t">Plates
+    <div class="r">
+      <button onclick="document.getElementById('f').click()">Add .eds files</button>
+      <button class="d" onclick="clearAll()">Clear</button>
+      <input type="file" id="f" accept=".eds" multiple style="display:none" onchange="pick(this)">
+    </div></div>
+    <div class="b">
+      <div id="drop"><b>Drop .eds files here</b>
+        One or more. Several plates can be analysed together, though they rarely share a baseline.</div>
+      <div id="plates"></div>
+    </div></div>
+
+  <div class="panel" id="ctrlPanel" style="display:none"><div class="t">Analysis</div><div class="b">
+    <div class="grid g4">
+      <label><i>Reference gene</i><select id="refT" onchange="run()"></select></label>
+      <label><i>Calibrator group</i><select id="calG" onchange="run()"></select></label>
+      <label><i>Min cqConf</i><input type="number" id="minConf" step="0.05" min="0" max="1" value="0.5" oninput="run()"></label>
+      <label><i>Max Cq <em>blank = none</em></i><input type="number" id="maxCq" step="1" value="40" oninput="run()"></label>
+    </div>
+    <div class="note i" style="margin-top:11px"><b>Why cqConf has a floor.</b> On a plate from
+      October 2026 a well flagged <code>AMP</code> carried a plausible Cq of 23.51 against
+      29.3&ndash;30.2 for its siblings, with a confidence of <b>0.031</b>. Because the instrument
+      calibrates on that sample it had crushed an entire panel. Nothing is dropped silently &mdash;
+      every exclusion is listed below.</div>
+  </div></div>
+
+  <div id="warn"></div>
+  <div id="out"></div>
+
+  <div class="panel" id="qcPanel" style="display:none"><div class="t">Excluded reactions
+    <div class="r"><span class="pill" id="qcCount"></span></div></div>
+    <div class="b"><div id="qc"></div></div></div>
+
+  <div class="panel"><div class="t">Validation
+    <div class="r"><button onclick="renderTests()">Run again</button></div></div>
+    <div class="b"><div id="tests"></div></div></div>
+</main>
+
+<script src="js/eds.js"></script>
+<script src="js/ddct.js"></script>
+<script src="js/fig.js"></script>
+<!-- Optional, gitignored: expected values for a known-good analysis.
+     Absent on a fresh checkout, which is intended - parity checks simply
+     do not run. See validation.example.json. -->
+<script src="validation.json" onerror="void 0"></script>
+<script>
+"use strict";
+let PLATES = [], A = null;
+
+/* ---------- loading ---------------------------------------------------- */
+const dz = document.getElementById("drop");
+["dragenter","dragover"].forEach(e=>dz.addEventListener(e,ev=>{
+  ev.preventDefault(); dz.classList.add("hot"); }));
+["dragleave","drop"].forEach(e=>dz.addEventListener(e,ev=>{
+  ev.preventDefault(); dz.classList.remove("hot"); }));
+dz.addEventListener("drop",ev=>load([...ev.dataTransfer.files]));
+function pick(i){ load([...i.files]); i.value=""; }
+
+async function load(files){
+  const eds = files.filter(f=>/\.eds$/i.test(f.name));
+  if(!eds.length){ alert("Those are not .eds files."); return; }
+  for(const f of eds){
+    try{
+      const t0 = performance.now();
+      const d = await EDS.parseFile(f);
+      d.ms = Math.round(performance.now()-t0);
+      if(PLATES.some(p=>p.filename===d.filename)){
+        if(!confirm(d.filename+" is already loaded. Add it again?")) continue;
+      }
+      PLATES.push(d);
+    }catch(e){
+      alert("Could not read "+f.name+":\n"+e.message);
+    }
+  }
+  renderPlates(); fillControls(); run();
+}
+function clearAll(){ PLATES=[]; A=null; renderPlates(); fillControls();
+  ["out","warn","qc"].forEach(i=>document.getElementById(i).innerHTML="");
+  document.getElementById("ctrlPanel").style.display="none";
+  document.getElementById("qcPanel").style.display="none";
+  stats(); }
+function dropPlate(i){ PLATES.splice(i,1); renderPlates(); fillControls(); run(); }
+
+function renderPlates(){
+  const el = document.getElementById("plates");
+  dz.style.display = PLATES.length ? "none" : "block";
+  if(!PLATES.length){ el.innerHTML=""; return; }
+  el.innerHTML = `<div class="scroll"><table><thead><tr><th>File</th><th>Block</th>
+    <th class="n">Wells</th><th>Targets</th><th>Endogenous</th><th>Ref sample</th>
+    <th class="n">Read</th><th></th></tr></thead><tbody>` +
+    PLATES.map((p,i)=>`<tr><td class="num" style="font-size:11.5px">${esc(p.filename)}</td>
+      <td class="hint">${esc(p.block)}</td><td class="n">${p.wells}</td>
+      <td class="hint">${p.targets.map(esc).join(", ")}</td>
+      <td>${p.endo.length?`<span class="tag k">${esc(p.endo.join(", "))}</span>`:'<span class="tag w">none set</span>'}</td>
+      <td class="num" style="font-size:11.5px">${esc(p.refSample||"-")}</td>
+      <td class="n">${p.ms} ms</td>
+      <td><button class="d" onclick="dropPlate(${i})">Remove</button></td></tr>`).join("") +
+    `</tbody></table></div>`;
+}
+function fillControls(){
+  const cp = document.getElementById("ctrlPanel");
+  cp.style.display = PLATES.length ? "block" : "none";
+  if(!PLATES.length) return;
+  const targets = [...new Set(PLATES.flatMap(p=>p.targets))];
+  const endo = PLATES.flatMap(p=>p.endo)[0] || targets[0];
+  const rt = document.getElementById("refT"), prevT = rt.value;
+  rt.innerHTML = targets.map(t=>`<option ${t===(targets.includes(prevT)?prevT:endo)?"selected":""}>${esc(t)}</option>`).join("");
+  const bg = Object.assign({}, ...PLATES.map(p=>p.biogroup));
+  const used = new Set(PLATES.flatMap(p=>p.rows.filter(r=>r.sample).map(r=>r.sample)));
+  const groups = [...new Set([...used].map(s=>bg[s]||s))].sort();
+  const refG = PLATES.map(p=>p.refGroup).find(Boolean) ||
+               (PLATES.map(p=>p.refSample).find(Boolean) ? bg[PLATES.map(p=>p.refSample).find(Boolean)] : null);
+  const cg = document.getElementById("calG"), prevG = cg.value;
+  const want = groups.includes(prevG) ? prevG : (refG && groups.includes(refG) ? refG : groups[0]);
+  cg.innerHTML = groups.map(g=>`<option ${g===want?"selected":""}>${esc(g)}</option>`).join("");
+}
+
+/* ---------- analysis --------------------------------------------------- */
+function run(){
+  if(!PLATES.length){ A=null; stats(); return; }
+  const mx = parseFloat(document.getElementById("maxCq").value);
+  A = DDCT.analyse(PLATES, {
+    refTarget: document.getElementById("refT").value,
+    calibrator: document.getElementById("calG").value,
+    minCqConf: parseFloat(document.getElementById("minConf").value) || 0,
+    maxCq: isFinite(mx) ? mx : null
+  });
+  renderWarnings(); renderOut(); renderQC(); stats(); renderTests();
+}
+function renderWarnings(){
+  document.getElementById("warn").innerHTML = A.warnings.map(w=>
+    `<div class="note ${w.lvl==="err"?"e":w.lvl==="warn"?"w":"i"}">${esc(w.msg)}</div>`).join("");
+}
+function renderOut(){
+  const rows = DDCT.table(A);
+  const out = document.getElementById("out");
+  if(!rows.length){ out.innerHTML = `<div class="stub">No usable data with these settings.</div>`; return; }
+  const chart = FIG.rqChart(A, {
+    title: "Relative quantity vs " + A.calibrator,
+    subtitle: "normalised to " + A.refTarget + "  ·  " +
+      PLATES.map(p=>p.filename.replace(/\.eds$/i,"")).join("  ·  "),
+    width: 1060 });
+  const ref = FIG.refChart(A, { title: "Reference-gene stability", width: 1060 });
+  out.innerHTML =
+    `<div class="panel"><div class="t">Results
+      <div class="r">
+        <button onclick="dl('csv')">CSV</button>
+        <button onclick="dl('svg')">SVG</button>
+        <button onclick="dl('png')">PNG</button>
+      </div></div>
+      <div class="b"><div class="figwrap">${chart}</div></div></div>
+     <div class="panel"><div class="t">Reference gene
+       <div class="r"><button onclick="dl('refsvg')">SVG</button></div></div>
+       <div class="b"><div class="figwrap">${ref}</div>
+       ${A.refStats ? `<div class="note ${A.refStats.range>2?"w":"k"}">
+         <b>${esc(A.refTarget)}</b>: mean ${A.refStats.mean.toFixed(2)} Cq, SD
+         ${A.refStats.sd.toFixed(2)}, range ${A.refStats.range.toFixed(2)} Cq across
+         ${A.refCq.length} samples. ${A.refStats.range>2
+           ? "That is a lot of movement in the denominator. A ratio is only as good as the gene it is divided by."
+           : "Acceptably flat."}</div>`:""}
+       </div></div>
+     <div class="panel"><div class="t">Table</div><div class="b scroll"><table>
+       <thead><tr><th>Group</th><th>Target</th><th class="n">RQ</th><th class="n">&minus;1 SE</th>
+         <th class="n">+1 SE</th><th class="n">n</th><th class="n">Replicates</th>
+         <th class="n">Mean Cq</th></tr></thead><tbody>` +
+       rows.map(v=>`<tr><td>${esc(v.group)}${v.group===A.calibrator?' <span class="tag">calibrator</span>':''}</td>
+         <td>${esc(v.target)}</td><td class="n"><b>${v.rq.toFixed(3)}</b></td>
+         <td class="n">${v.lo.toFixed(3)}</td><td class="n">${v.hi.toFixed(3)}</td>
+         <td class="n">${v.n}</td>
+         <td class="n hint">${v.reps.map(x=>x.toFixed(2)).join("  ")}</td>
+         <td class="n">${v.cq==null||!isFinite(v.cq)?"":v.cq.toFixed(2)}</td></tr>`).join("") +
+       `</tbody></table>
+       <div class="hint" style="margin-top:9px">RQ is the <b>geometric</b> mean of biological
+         replicates, with &plusmn;1 SE computed in log space. A ratio's natural centre is
+         geometric, which is also why the calibrator lands on exactly 1.000.</div>
+       </div></div>`;
+}
+function renderQC(){
+  const p = document.getElementById("qcPanel");
+  const n = A.nDropped;
+  p.style.display = "block";
+  document.getElementById("qcCount").textContent = n + " excluded";
+  if(!n){ document.getElementById("qc").innerHTML =
+    `<div class="note k">No reactions excluded. Every well passed QC.</div>`; return; }
+  let h = "";
+  for(const [why, list] of A.drops){
+    const bad = /cqConf|undetermined/.test(why);
+    h += `<div class="note ${bad?"w":""}"><b>${list.length}</b> &mdash; ${esc(why)}</div>`;
+    h += `<div class="scroll" style="margin-bottom:11px"><table><thead><tr><th>Well</th>
+      <th>Sample</th><th>Target</th><th class="n">Cq</th><th class="n">cqConf</th><th>Plate</th>
+      </tr></thead><tbody>` + list.slice(0,60).map(d=>`<tr><td class="num">${esc(d.well)}</td>
+      <td class="num">${esc(d.sample)}</td><td>${esc(d.target)}</td>
+      <td class="n">${d.cq==null||!isFinite(d.cq)?"&mdash;":d.cq.toFixed(2)}</td>
+      <td class="n">${d.cqConf==null||!isFinite(d.cqConf)?"&mdash;":d.cqConf.toFixed(3)}</td>
+      <td class="hint" style="font-size:11px">${esc((d.plate||"").replace(/\.eds$/i,""))}</td></tr>`).join("")
+      + (list.length>60?`<tr><td colspan="6" class="hint">and ${list.length-60} more</td></tr>`:"")
+      + `</tbody></table></div>`;
+  }
+  document.getElementById("qc").innerHTML = h;
+}
+function stats(){
+  const n = A ? DDCT.table(A).length : 0;
+  const warn = A ? A.warnings.filter(w=>w.lvl==="warn").length : 0;
+  const err  = A ? A.warnings.filter(w=>w.lvl==="err").length : 0;
+  document.getElementById("stats").innerHTML =
+    [["Plates",PLATES.length,""],["Groups",A?A.groups.length:0,""],["Targets",A?A.targets.length:0,""],
+     ["Results",n,""],["Excluded",A?A.nDropped:0,(A&&A.nDropped)?"warn":""],
+     ["Warnings",warn,warn?"warn":""],["Errors",err,err?"err":""]]
+    .map(s=>`<div class="s ${s[2]}"><b>${s[1]}</b><span>${s[0]}</span></div>`).join("");
+}
+
+/* ---------- export ----------------------------------------------------- */
+function save(blob,name){
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=name;
+  a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
+const stem = () => (PLATES[0]?PLATES[0].filename.replace(/\.eds$/i,""):"qpcr") + "_" + A.refTarget;
+async function dl(kind){
+  if(!A) return;
+  if(kind==="csv") return save(new Blob([DDCT.toCSV(A)],{type:"text/csv"}), stem()+".csv");
+  const svg = kind==="refsvg" ? FIG.refChart(A,{title:"Reference-gene stability",width:1060})
+    : FIG.rqChart(A,{title:"Relative quantity vs "+A.calibrator,
+        subtitle:"normalised to "+A.refTarget, width:1060});
+  if(kind==="svg"||kind==="refsvg")
+    return save(new Blob([svg],{type:"image/svg+xml"}), stem()+(kind==="refsvg"?"_refgene":"")+".svg");
+  try{ save(await FIG.svgToPng(svg,3), stem()+".png"); }
+  catch(e){ alert("PNG export failed: "+e.message+"\nThe SVG export always works."); }
+}
+
+/* ---------- validation ------------------------------------------------- */
+function runTests(){
+  const T=[], ok=(name,cond,detail)=>T.push({name,pass:!!cond,detail:detail||""});
+  const near=(a,b,tol)=>Math.abs(a-b)<=(tol==null?1e-9:tol);
+
+  // pure, always runnable
+  ok("Bare NaN in instrument JSON is sanitised",
+     EDS.parseJSON('{"a":NaN,"b":1,"c":[NaN,2],"d":-Infinity}').a===null &&
+     EDS.parseJSON('{"a":NaN,"b":1,"c":[NaN,2],"d":-Infinity}').b===1);
+  ok("A sample name containing “NaN” survives sanitising",
+     EDS.parseJSON('{"s":"NaN_control"}').s==="NaN_control");
+  ok("384-well index 0 is A1, 23 is A24, 24 is B1",
+     EDS.wellPos(0,24)==="A1" && EDS.wellPos(23,24)==="A24" && EDS.wellPos(24,24)==="B1");
+  ok("96-well index 12 is B1", EDS.wellPos(12,12)==="B1");
+  const o=DDCT.DEFAULTS;
+  ok("Undetermined sentinel (Cq -1) is excluded",
+     DDCT.qcReason({cq:-1,cqConf:0.9},o)==="undetermined");
+  ok("A low-confidence Cq is excluded, not trusted",
+     /cqConf/.test(DDCT.qcReason({cq:23.51,cqConf:0.031},o)||""));
+  ok("A good reaction passes", DDCT.qcReason({cq:25.2,cqConf:0.89},o)===null);
+  ok("An operator-omitted well is excluded",
+     DDCT.qcReason({cq:25,cqConf:0.9,omitted:true},o)==="omitted by operator");
+  ok("Zissou1 palette gives n distinct colours for n groups",
+     new Set(FIG.palette(9)).size===9, FIG.palette(5).join(" "));
+
+  // parity against the October 2026 analysis, when the matching plate is loaded
+  if(A){
+    ok("Calibrator sits at exactly 1.000",
+       A.targets.every(t=>{ const v=A.res.get(A.calibrator+"\u0000"+t);
+         return !v || near(v.rq,1,1e-12); }),
+       "calibrator " + A.calibrator);
+    const g=(grp,t)=>{ const v=A.res.get(grp+"\u0000"+t); return v?v.rq:null; };
+    /* Parity expectations are NOT in this file. They name real compounds and
+       carry unpublished results, so they live in validation.json, which is
+       gitignored. See validation.example.json for the format. */
+    const P = window.LAB_PARITY;
+    if(P && P.refTarget===A.refTarget && P.calibrator===A.calibrator &&
+       A.options.minCqConf===(P.minCqConf==null?0.5:P.minCqConf)){
+      for(const e of (P.expect||[])){
+        const got = g(e.group, e.target);
+        ok("Parity: "+e.group+" "+e.target+" = "+e.rq,
+           got!==null && near(got, e.rq, e.tol==null?0.001:e.tol),
+           got===null ? "not in this dataset" : got.toFixed(4));
+      }
+    }
+    const any = DDCT.table(A)[0];
+    if(any && any.n>1){
+      const geo = Math.pow(any.reps.reduce((a,b)=>a*b,1), 1/any.reps.length);
+      ok("Group RQ is the geometric mean of its replicates", near(any.rq,geo,1e-9),
+         any.group+" / "+any.target);
+    }
+    ok("Every excluded reaction is accounted for",
+       A.nDropped===[...A.drops.values()].reduce((s,x)=>s+x.length,0));
+    ok("CSV export has one row per result plus a header",
+       DDCT.toCSV(A).trim().split("\n").length===DDCT.table(A).length+1);
+  }
+  return T;
+}
+function renderTests(){
+  const T=runTests(), pass=T.filter(t=>t.pass).length;
+  const parity = T.some(t=>/^Parity/.test(t.name));
+  document.getElementById("tests").innerHTML =
+    `<div class="note ${pass===T.length?"k":"e"}"><b>${pass} of ${T.length} checks pass.</b>
+      ${parity ? "Includes parity against the October 2026 analysis of this plate — the browser "+
+                 "pipeline reproduces the figures computed independently at the time."
+               : "Load validation.json and its matching plate to add parity checks against a known-good analysis."}</div>
+     <div class="scroll"><table><thead><tr><th style="width:52px">Result</th><th>Check</th>
+       <th>Value</th></tr></thead><tbody>` +
+     T.map(t=>`<tr><td>${t.pass?'<span class="tag k">pass</span>':'<span class="tag e">fail</span>'}</td>
+       <td>${esc(t.name)}</td><td class="num hint">${esc(t.detail)}</td></tr>`).join("") +
+     `</tbody></table></div>`;
+}
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,c=>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+if(!("DecompressionStream" in window)){
+  document.getElementById("warn").innerHTML =
+    `<div class="note e"><b>This browser cannot read .eds files.</b> It lacks
+     <code>DecompressionStream</code>, which is needed to decompress the archive. Use a recent
+     Chrome or Edge.</div>`;
+}
+stats(); renderTests();
+</script>
+</body>
+</html>

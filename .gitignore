@@ -1,0 +1,16 @@
+# Real oligo sequences - NEVER commit. Unfiled ASO sequences in a public
+# repository are a novelty-destroying disclosure. Use oligos.example.json
+# as the template; keep the real file local.
+oligos.json
+validation.json
+
+# Instrument and experiment data
+*.eds
+*.edt
+*.xlsx
+experiments/
+*.experiment.json
+
+# OS noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1698 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transfection Planner</title>
+<!--
+===============================================================================
+  ASO & GAPMER TRANSFECTION PLANNER  -  Phase 2 prototype
+  Built 14 Nov 2026 from ASO_TransfectionHepG2_curve.xlsx
+
+  SINGLE SELF-CONTAINED FILE. No server, no build step, no network. Open this
+  file in any browser, or drop it on GitHub Pages unchanged. It is one file so
+  that it survives being emailed, copied to a USB stick or renamed - a lab tool
+  that breaks when a sibling file goes missing is no use to a student.
+
+  Internally it is modular. Sections in order:
+     UNITS    unit normalisation, no DOM
+     FORMATS  vessel geometry table
+     METHODS  transfection method definitions
+     CALC     pure calculation core, no DOM, fully testable
+     STATE    experiment object, persistence, example data
+     PLATE    grid geometry and selection
+     UI       rendering and event wiring
+     TESTS    self-validation, runs against the source workbook's own numbers
+
+  CALC is deliberately free of DOM access so that every number on screen can be
+  reproduced and tested in isolation. See the Validation panel.
+
+  DECISIONS THIS BUILD IMPLEMENTS (see tools/transfection-planner-decisions.md)
+     D1  per-format editable volumes; 96-well stays 90+10=100 uL as measured
+     D2  ONE excess rule for every component; default 10% + 1 well dead volume
+     D3  HEK293T and HeLa only, both flagged unvalidated; no HepG2
+     D4  legacy plasmid columns (DNA amount, Vol Tfec rate) dropped
+     D5  minimum pipetting volume 0.4 uL; intermediate dilutions are core
+     D6  the ORDER "B" prefix is an opaque label and is never parsed
+===============================================================================
+-->
+<style>
+/* ---------------------------------------------------------------- tokens */
+:root{
+  --ink:#1b1b1b; --ink2:#55534e; --mute:#78766f; --faint:#a3a19c;
+  --line:#d8d6d0; --line2:#e8e6e1; --bg:#f4f3f0; --panel:#ffffff;
+  --teal:#3b9ab2; --teal-d:#2b7489; --gold:#e1af00; --red:#b33a1e;
+  --green:#3b7a57; --violet:#7b6ca8;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{font-family:var(--sans);font-size:13px;color:var(--ink);background:var(--bg);
+     -webkit-font-smoothing:antialiased}
+h1,h2,h3{margin:0;font-weight:600}
+button,input,select,textarea{font-family:inherit;font-size:13px;color:var(--ink)}
+input,select,textarea{border:1px solid var(--line);background:#fff;padding:5px 7px;
+     border-radius:2px;width:100%}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--teal);outline-offset:-1px;border-color:var(--teal)}
+input[type=number]{font-family:var(--mono);text-align:right}
+textarea{resize:vertical;min-height:52px}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ---------------------------------------------------------------- chrome */
+#top{background:#232220;color:#f2f1ee;padding:0 16px;display:flex;align-items:center;
+     gap:18px;height:46px;position:sticky;top:0;z-index:50}
+#top h1{font-size:13px;letter-spacing:.09em;text-transform:uppercase;font-weight:600;white-space:nowrap}
+#top .eid{font-family:var(--mono);font-size:12px;color:#b9b7b1;border-left:1px solid #46443f;padding-left:18px}
+#stats{margin-left:auto;display:flex;gap:0;font-size:11px}
+#stats .s{padding:0 13px;border-left:1px solid #46443f;text-align:right;line-height:1.25}
+#stats .s b{display:block;font-family:var(--mono);font-size:14px;font-weight:600;color:#fff}
+#stats .s span{color:#908e88;text-transform:uppercase;letter-spacing:.06em;font-size:9.5px}
+#stats .s.warn b{color:var(--gold)} #stats .s.err b{color:#ff8a6a}
+
+#shell{display:flex;align-items:flex-start;min-height:calc(100vh - 46px)}
+#nav{width:208px;flex:0 0 208px;background:#edebe7;border-right:1px solid var(--line);
+     position:sticky;top:46px;height:calc(100vh - 46px);overflow-y:auto;padding:10px 0}
+#nav a{display:flex;gap:9px;align-items:baseline;padding:7px 14px;color:var(--ink2);
+     text-decoration:none;border-left:2px solid transparent;cursor:pointer}
+#nav a .n{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+#nav a:hover{background:#e4e2dd;color:var(--ink)}
+#nav a.on{background:#fff;border-left-color:var(--teal);color:var(--ink);font-weight:600}
+#nav a.todo{color:var(--faint)} #nav a.todo:hover{color:var(--mute)}
+#nav .grp{padding:12px 14px 5px;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+#main{flex:1;min-width:0;padding:18px 22px 70px}
+section{display:none;max-width:1320px} section.on{display:block}
+
+/* ---------------------------------------------------------------- panels */
+.hd{margin-bottom:14px}
+.hd h2{font-size:17px;letter-spacing:-.01em}
+.hd p{margin:4px 0 0;color:var(--mute);max-width:72ch;line-height:1.5}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:3px;margin-bottom:14px}
+.panel>.t{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--mute);
+     padding:8px 13px;border-bottom:1px solid var(--line2);display:flex;align-items:center;gap:10px}
+/* Units must NEVER be case-transformed: uppercasing turns the micro sign into
+   Greek capital Mu, so "uL" reads as "ML" and "uM" as "mM" - a 1000x misread. */
+.u,.panel>.t.data{text-transform:none}
+.panel>.t.data{font-size:12px;letter-spacing:0;color:var(--ink);font-weight:600}
+.panel>.t .r{margin-left:auto;display:flex;gap:6px;text-transform:none;letter-spacing:0;font-size:12px}
+.panel>.b{padding:13px}
+.grid{display:grid;gap:11px}
+.g2{grid-template-columns:repeat(2,1fr)} .g3{grid-template-columns:repeat(3,1fr)}
+.g4{grid-template-columns:repeat(4,1fr)} .g5{grid-template-columns:repeat(5,1fr)}
+@media(max-width:1100px){.g4,.g5{grid-template-columns:repeat(2,1fr)}.g3{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:720px){.grid{grid-template-columns:1fr!important}#nav{display:none}}
+label{display:block}
+label>i{display:block;font-style:normal;font-size:10.5px;color:var(--mute);margin-bottom:3px;
+     text-transform:uppercase;letter-spacing:.05em}
+label>i em{font-style:normal;color:var(--faint);text-transform:none;letter-spacing:0}
+
+/* ---------------------------------------------------------------- buttons */
+button{background:#fff;border:1px solid var(--line);border-radius:2px;padding:5px 11px;
+     cursor:pointer;color:var(--ink2);white-space:nowrap;width:auto}
+button:hover{border-color:var(--mute);color:var(--ink);background:#faf9f7}
+button.p{background:var(--teal);border-color:var(--teal-d);color:#fff;font-weight:600}
+button.p:hover{background:var(--teal-d);color:#fff}
+button.d{color:var(--red)} button.d:hover{border-color:var(--red);background:#fdf3f0}
+button:disabled{opacity:.4;cursor:not-allowed}
+.btns{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+
+/* ---------------------------------------------------------------- tables */
+table{border-collapse:collapse;width:100%;font-size:12.5px}
+th{text-align:left;font-size:9.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--mute);
+   font-weight:600;padding:7px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:6px 9px;border-bottom:1px solid var(--line2);vertical-align:top}
+tr:last-child td{border-bottom:0}
+td.n,th.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+tbody tr:hover{background:#fafaf8}
+tfoot td{border-top:2px solid var(--line);border-bottom:0;font-weight:600;background:#faf9f7}
+.scroll{overflow-x:auto}
+
+/* ---------------------------------------------------------------- notes */
+.note{border-left:3px solid var(--line);background:#faf9f7;padding:8px 11px;margin:9px 0;
+      color:var(--ink2);line-height:1.5;border-radius:0 2px 2px 0}
+.note.w{border-left-color:var(--gold);background:#fdf9ec}
+.note.e{border-left-color:var(--red);background:#fdf2ef}
+.note.i{border-left-color:var(--teal);background:#eff7fa}
+.note.k{border-left-color:var(--green);background:#f0f6f2}
+.note b{color:var(--ink)}
+.tag{display:inline-block;font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;
+     padding:1.5px 6px;border-radius:2px;border:1px solid var(--line);color:var(--mute);
+     background:#fff;vertical-align:middle;font-weight:600}
+.tag.w{border-color:var(--gold);color:#8a6d00;background:#fdf9ec}
+.tag.e{border-color:var(--red);color:var(--red);background:#fdf2ef}
+.tag.k{border-color:var(--green);color:var(--green);background:#f0f6f2}
+.tag.t{border-color:var(--teal);color:var(--teal-d);background:#eff7fa}
+.hint{color:var(--mute);font-size:11.5px;line-height:1.5}
+.sep{height:1px;background:var(--line2);margin:12px 0}
+
+/* ---------------------------------------------------------------- plate */
+#plateWrap{overflow:auto;padding:4px 0}
+table.plate{border-collapse:separate;border-spacing:3px;width:auto}
+table.plate th{padding:0;font-size:10px;color:var(--mute);text-align:center;border:0;
+     font-family:var(--mono);min-width:34px}
+table.plate th.rh{min-width:18px;text-align:right;padding-right:3px}
+table.plate th.sel{cursor:pointer;border-radius:2px}
+table.plate th.sel:hover{background:var(--line2);color:var(--ink)}
+td.w{width:34px;height:34px;padding:0;border:1px solid var(--line);border-radius:2px;
+     cursor:pointer;position:relative;background:#fff;text-align:center;vertical-align:middle;
+     font-family:var(--mono);font-size:9px;color:var(--mute);user-select:none;overflow:hidden}
+td.w.has{color:#fff;border-color:rgba(0,0,0,.18)}
+td.w.sel{outline:2px solid var(--ink);outline-offset:-2px;z-index:2}
+td.w.ctl::after{content:"";position:absolute;left:0;top:0;border-top:7px solid rgba(0,0,0,.45);
+     border-right:7px solid transparent}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:11px}
+.legend .it{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink2)}
+.legend .sw{width:11px;height:11px;border-radius:2px;border:1px solid rgba(0,0,0,.14);flex:0 0 auto}
+.modes{display:flex;gap:0;border:1px solid var(--line);border-radius:2px;overflow:hidden;width:fit-content}
+.modes button{border:0;border-right:1px solid var(--line);border-radius:0;font-size:11.5px;padding:4px 10px}
+.modes button:last-child{border-right:0}
+.modes button.on{background:var(--teal);color:#fff;font-weight:600}
+.ptabs{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-bottom:11px}
+.ptabs .pt{padding:5px 11px;border:1px solid var(--line);border-radius:2px;background:#fff;
+     cursor:pointer;font-size:12px;color:var(--ink2)}
+.ptabs .pt.on{background:#232220;border-color:#232220;color:#fff;font-weight:600}
+#insp{position:sticky;top:60px}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:3.5px 0;border-bottom:1px dotted var(--line2)}
+.kv:last-child{border-bottom:0}
+.kv span{color:var(--mute)} .kv b{font-family:var(--mono);font-weight:600}
+.pill{font-family:var(--mono);font-size:11px;background:#f0efec;border:1px solid var(--line);
+      padding:1px 5px;border-radius:2px;color:var(--ink2)}
+code{font-family:var(--mono);font-size:11.5px;background:#f0efec;padding:1px 4px;border-radius:2px}
+.stub{border:1px dashed var(--line);border-radius:3px;padding:26px;text-align:center;color:var(--mute);background:#fafaf8}
+.stub h3{color:var(--ink2);font-size:14px;margin-bottom:6px}
+</style>
+</head>
+<body>
+
+<div id="top">
+  <h1>Transfection Planner</h1>
+  <div class="eid" id="topId">-</div>
+  <div id="stats"></div>
+</div>
+
+<div id="shell">
+  <nav id="nav">
+    <div class="grp">Plan</div>
+    <a data-s="setup" class="on"><span class="n">1</span>Experiment Setup</a>
+    <a data-s="seed" class="todo"><span class="n">2</span>Cell Seeding</a>
+    <a data-s="design"><span class="n">3</span>Plate Designer</a>
+    <a data-s="oligos"><span class="n">4</span>ASO &amp; Gapmer Setup</a>
+    <div class="grp">Calculate</div>
+    <a data-s="calc"><span class="n">5</span>Transfection Calculator</a>
+    <a data-s="mixes"><span class="n">6</span>Master Mixes</a>
+    <div class="grp">Run</div>
+    <a data-s="protocol" class="todo"><span class="n">7</span>Protocol</a>
+    <a data-s="export" class="todo"><span class="n">8</span>Documentation &amp; Export</a>
+    <div class="grp">Reference</div>
+    <a data-s="formats"><span class="n">F</span>Vessel Formats</a>
+    <a data-s="tests"><span class="n">V</span>Validation</a>
+  </nav>
+
+  <main id="main">
+
+  <!-- ============================================================ SETUP -->
+  <section id="s-setup" class="on">
+    <div class="hd"><h2>Experiment Setup</h2>
+      <p>Metadata travels with every export, so a layout can always be traced back to who ran it
+         and when. Nothing here affects a calculation except cell line and the global settings.</p></div>
+
+    <div class="panel"><div class="t">Identification</div><div class="b">
+      <div class="grid g4">
+        <label><i>Experiment name</i><input id="m_name"></label>
+        <label><i>Experiment ID</i><input id="m_id" class="num"></label>
+        <label><i>Researcher / student</i><input id="m_res"></label>
+        <label><i>Date created</i><input id="m_date" type="date"></label>
+      </div>
+    </div></div>
+
+    <div class="panel"><div class="t">Cells</div><div class="b">
+      <div class="grid g4">
+        <label><i>Cell line</i><select id="m_cell"></select></label>
+        <label><i>Passage number</i><input id="m_pass"></label>
+        <label><i>Seeding date <em>Day -1</em></i><input id="m_seedD" type="date"></label>
+        <label><i>Transfection date <em>Day 0</em></i><input id="m_txD" type="date"></label>
+      </div>
+      <div class="grid g4" style="margin-top:11px">
+        <label><i>Harvest date</i><input id="m_hvD" type="date"></label>
+        <label><i>Harvest time</i><input id="m_hvT" type="time"></label>
+        <label style="grid-column:span 2"><i>Add a cell line</i>
+          <div class="btns"><input id="m_newCell" placeholder="name" style="flex:1">
+            <input id="m_newDens" type="number" placeholder="cells/cm2" style="width:120px">
+            <button onclick="addCellLine()">Add</button></div></label>
+      </div>
+      <div id="cellNote"></div>
+    </div></div>
+
+    <div class="panel"><div class="t">Purpose and method</div><div class="b">
+      <div class="grid g2">
+        <label><i>Experimental purpose</i><textarea id="m_purp"></textarea></label>
+        <label><i>Notes</i><textarea id="m_notes"></textarea></label>
+      </div>
+      <div class="note i" style="margin-top:11px">Transfection method and reagent are set
+        <b>per plate</b> in the Plate Designer, not globally &mdash; different plates in one
+        experiment may legitimately use different chemistry. The brief requires that methods
+        keep independent calculation settings, so no single value is forced here.</div>
+    </div></div>
+
+    <div class="panel"><div class="t">Global calculation settings</div><div class="b">
+      <div class="grid g5">
+        <label><i>Excess <em>%</em></i><input id="g_exc" type="number" step="0.5"></label>
+        <label><i>Dead volume <em>wells</em></i><input id="g_dead" type="number" step="0.1"></label>
+        <label><i>Min pipetting <em>&micro;L</em></i><input id="g_min" type="number" step="0.05"></label>
+        <label><i>Display decimals</i><input id="g_dec" type="number" step="1" min="0" max="3"></label>
+        <label><i>Condition numbering</i><select id="g_scope">
+          <option value="experiment">Global per experiment</option>
+          <option value="plate">Per plate</option></select></label>
+      </div>
+      <div class="note w"><b>One excess rule, applied identically to every component.</b>
+        The source workbook ran the ASO tube at +9.4% (wells hand-typed as 35 against a real 32)
+        and the lipid tube at +15.2% (<code>(sum &times; 1.05) + 1</code>), while appearing to
+        promise 5%. That is now a single number you control, with dead volume named separately
+        instead of hidden as a <code>+1</code> inside a formula.</div>
+      <div class="note"><b>Minimum pipetting volume binds hard on dose-response work.</b>
+        From a 400&nbsp;&micro;M stock into 100&nbsp;&micro;L wells the oligo volume per well is
+        <code>C &times; 0.25</code>&nbsp;&micro;L, so one well falls below 0.4&nbsp;&micro;L for
+        any target under 1.6&nbsp;&micro;M. A 35-well master mix buys room down to about 46&nbsp;nM.
+        Below that an intermediate dilution is mandatory, and the calculator proposes one.</div>
+      <div class="btns"><button onclick="loadExample()">Reload workbook example</button>
+        <button onclick="newExperiment()">Start empty experiment</button>
+        <button onclick="exportJSON()">Save JSON</button>
+        <button onclick="document.getElementById('imp').click()">Open JSON</button>
+        <input type="file" id="imp" accept=".json" style="display:none" onchange="importJSON(this)">
+      </div>
+      <div class="hint" style="margin-top:8px">Work is also kept in this browser automatically.
+        JSON export is the portable copy &mdash; browser storage is per-machine and can be cleared.</div>
+    </div></div>
+  </section>
+
+  <!-- ============================================================ OLIGOS -->
+  <section id="s-oligos">
+    <div class="hd"><h2>ASO &amp; Gapmer Setup</h2>
+      <p>The oligo registry. Stock concentration lives here, so changing a stock updates every
+         plate that uses it rather than needing a hunt through strip rows.</p></div>
+    <div class="panel"><div class="t">Oligos<div class="r"><button onclick="addOligo()">Add oligo</button></div></div>
+      <div class="b scroll"><table id="oligoTbl"></table></div></div>
+    <div class="note i"><b>Chemistry is not cosmetic.</b> It is carried into the master-mix
+      grouping key, so a gapmer and a steric blocker at the same nominal concentration are never
+      pooled into one mix.</div>
+
+    <div class="panel" id="libPanel"><div class="t">Oligo library
+      <div class="r">
+        <button onclick="document.getElementById('libFile').click()">Load library</button>
+        <button onclick="exportLibrary()">Save library</button>
+        <button class="d" onclick="clearLibrary()">Forget</button>
+        <input type="file" id="libFile" accept=".json" style="display:none" onchange="importLibrary(this)">
+      </div></div>
+      <div class="b">
+        <div id="libStatus"></div>
+        <div id="libDrop" class="stub" style="margin-top:11px;padding:18px">
+          Drop <code>oligos.json</code> here, or use <b>Load library</b>.
+        </div>
+        <div id="libList" class="scroll"></div>
+      </div></div>
+  </section>
+
+  <!-- ============================================================ DESIGN -->
+  <section id="s-design">
+    <div class="hd"><h2>Plate Designer</h2>
+      <p>Click a well, drag a rectangle, shift-click to extend, or click a row or column header.
+         Then assign below. Wells are the single source of truth: master mixes are derived from
+         them and can never disagree with what is on the plate.</p></div>
+
+    <div class="ptabs" id="ptabs"></div>
+
+    <div class="panel"><div class="t">Plate properties</div><div class="b">
+      <div class="grid g5">
+        <label><i>Plate ID</i><input id="p_id"></label>
+        <label><i>Format</i><select id="p_fmt"></select></label>
+        <label id="p_vcWrap"><i>Vessel count</i><input id="p_vc" type="number" min="1" max="48"></label>
+        <label><i>Cell line</i><select id="p_cell"></select></label>
+        <label><i>Method</i><select id="p_meth"></select></label>
+      </div>
+      <div class="grid g4" style="margin-top:11px">
+        <label><i>Plate harvest timepoint <em>h</em></i><input id="p_tp" type="number" min="0"></label>
+        <label style="grid-column:span 3"><i>Plate notes</i><input id="p_notes"></label>
+      </div>
+      <div id="fmtInfo"></div>
+    </div></div>
+
+    <div class="grid" style="grid-template-columns:minmax(0,1fr) 322px;align-items:start">
+      <div>
+        <div class="panel"><div class="t">Layout
+          <div class="r">
+            <div class="modes" id="modes"></div>
+          </div></div>
+          <div class="b">
+            <div class="btns" style="margin-bottom:10px">
+              <button onclick="selAll()">All</button>
+              <button onclick="selNone()">None</button>
+              <button onclick="selUnassigned()">Unassigned</button>
+              <button onclick="selInvert()">Invert</button>
+              <span style="width:9px"></span>
+              <button onclick="copyWell()">Copy</button>
+              <button onclick="pasteWell()">Paste</button>
+              <button class="d" onclick="clearSel()">Clear wells</button>
+            </div>
+            <div id="plateWrap"></div>
+            <div class="legend" id="legend"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="insp">
+        <div class="panel"><div class="t">Assign to selection</div><div class="b">
+          <div id="selCount" class="hint" style="margin-bottom:10px"></div>
+          <label style="margin-bottom:9px"><i>Oligo</i><select id="a_oligo"></select></label>
+          <div class="grid g2" style="margin-bottom:9px">
+            <label><i>Concentration</i><input id="a_conc" type="number" step="any"></label>
+            <label><i>Unit</i><select id="a_cu"><option>nM</option><option selected>&micro;M</option></select></label>
+          </div>
+          <div class="grid g2" style="margin-bottom:9px">
+            <label><i>Treatment group</i><input id="a_grp"></label>
+            <label><i>Control type</i><select id="a_ctl">
+              <option value="">not a control</option>
+              <option value="untreated">untreated</option>
+              <option value="mock">mock transfection</option>
+              <option value="scrambled">scrambled oligo</option>
+              <option value="positive">positive control</option>
+            </select></label>
+          </div>
+          <div class="grid g3" style="margin-bottom:9px">
+            <label><i>Bio rep</i><input id="a_bio" type="number" min="1"></label>
+            <label><i>Tech rep</i><input id="a_tech" type="number" min="1"></label>
+            <label><i>Timepoint <em>h</em></i><input id="a_tp" type="number" min="0"></label>
+          </div>
+          <label style="margin-bottom:10px"><i>Well note</i><input id="a_note"></label>
+          <div class="btns"><button class="p" onclick="applyAssign()">Apply to selection</button></div>
+          <div class="sep"></div>
+          <div class="t" style="padding:0 0 7px;border:0">Series across selection</div>
+          <div class="grid g3" style="margin-bottom:9px">
+            <label><i>From</i><input id="d_hi" type="number" step="any"></label>
+            <label><i>To</i><input id="d_lo" type="number" step="any"></label>
+            <label><i>Scale</i><select id="d_scale">
+              <option value="log">log</option><option value="lin">linear</option></select></label>
+          </div>
+          <div class="grid g2" style="margin-bottom:9px">
+            <label><i>Unit</i><select id="d_cu"><option>nM</option><option selected>&micro;M</option></select></label>
+            <label><i>Direction</i><select id="d_dir">
+              <option value="col">by column</option><option value="row">by row</option></select></label>
+          </div>
+          <div class="btns"><button onclick="applyGradient()">Apply series</button></div>
+        </div></div>
+
+        <div class="panel"><div class="t">Replicates</div><div class="b">
+          <div class="hint" style="margin-bottom:9px">Number the current selection automatically.</div>
+          <div class="grid g2" style="margin-bottom:9px">
+            <label><i>Number</i><select id="r_what">
+              <option value="tech">technical reps</option><option value="bio">biological reps</option></select></label>
+            <label><i>Across</i><select id="r_dir">
+              <option value="row">each row</option><option value="col">each column</option></select></label>
+          </div>
+          <div class="btns"><button onclick="autoReps()">Number selection</button></div>
+        </div></div>
+
+        <div class="panel"><div class="t">Plates</div><div class="b">
+          <div class="btns">
+            <button onclick="addPlate()">Add plate</button>
+            <button onclick="dupPlate()">Duplicate</button>
+            <button class="d" onclick="delPlate()">Delete</button>
+          </div>
+          <div class="hint" style="margin-top:8px">Duplicating copies the layout, so a timepoint
+            series is one edit per plate rather than a full redesign.</div>
+        </div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ CALC -->
+  <section id="s-calc">
+    <div class="hd"><h2>Transfection Calculator</h2>
+      <p>A single condition, worked through step by step. Use it to sanity-check one number or to
+         plan before committing anything to a plate. The master-mix page does the same arithmetic
+         across every well at once.</p></div>
+    <div class="panel"><div class="t">Inputs</div><div class="b">
+      <div class="grid g5">
+        <label><i>Format</i><select id="c_fmt"></select></label>
+        <label><i>Method</i><select id="c_meth"></select></label>
+        <label><i>Stock conc.</i><input id="c_stock" type="number" step="any"></label>
+        <label><i>Stock unit</i><select id="c_su"><option>&micro;M</option><option>mM</option></select></label>
+        <label><i>Wells</i><input id="c_n" type="number" min="1" step="1"></label>
+      </div>
+      <div class="grid g5" style="margin-top:11px">
+        <label><i>Target conc.</i><input id="c_final" type="number" step="any"></label>
+        <label><i>Target unit</i><select id="c_fu"><option>nM</option><option selected>&micro;M</option></select></label>
+        <label><i>Media / well <em>&micro;L</em></i><input id="c_media" type="number" step="any"></label>
+        <label><i>Volume per tube <em>&micro;L</em></i><input id="c_part" type="number" step="any"></label>
+        <label><i>Reagent / well <em>&micro;L</em></i><input id="c_rg" type="number" step="any"></label>
+      </div>
+      <div class="hint" style="margin-top:9px">Changing the format reloads its stored defaults.
+        Everything stays editable afterwards.</div>
+    </div></div>
+    <div id="calcOut"></div>
+  </section>
+
+  <!-- ============================================================ MIXES -->
+  <section id="s-mixes">
+    <div class="hd"><h2>Master Mixes</h2>
+      <p>Derived from the plate layout, never typed. Wells are grouped only when every variable
+         matches &mdash; oligo, chemistry, stock, target concentration, reagent and amount,
+         culture volume and protocol. Conditions that differ in any of those are never pooled.</p></div>
+    <div id="mixOut"></div>
+  </section>
+
+  <!-- ============================================================ FORMATS -->
+  <section id="s-formats">
+    <div class="hd"><h2>Vessel Formats</h2>
+      <p>Starting values from the workbook's <code>Numbers</code> sheet. Manufacturers differ, so
+         everything here is editable and changes flow straight into the calculators.</p></div>
+    <div class="panel"><div class="t">Geometry and default volumes</div>
+      <div class="b scroll"><table id="fmtTbl"></table></div></div>
+    <div class="note w"><b>35&nbsp;mm is listed at 8.8&nbsp;cm&sup2; but 6-well at 9.6&nbsp;cm&sup2;.</b>
+      In most catalogues these are the same vessel. Both values are as found in the workbook; one
+      is probably wrong, and the difference moves seeding by about 9%.</div>
+    <div class="note"><b>Only the 96-well row is measured.</b> It reproduces the workbook exactly
+      (90&nbsp;&micro;L media + 10&nbsp;&micro;L mix = 100&nbsp;&micro;L, 0.3&nbsp;&micro;L RNAiMAX).
+      Every other row holds conventional working volumes with the mix at 10% of total and reagent
+      at 0.30% v/v, scaled from that one measured row. They are starting points, not validated
+      lab values. Thermo quotes 9&nbsp;&micro;L RNAiMAX for a 6-well, against the 6.0 derived here.</div>
+    <div class="note e"><b>Dropped from the workbook:</b> <code>DNA amount</code> (312.5&nbsp;ng/cm&sup2;)
+      and <code>Vol Tfec rate</code> (<code>=12.5/C9</code>). An ASO protocol has no ng amount, and
+      the transfection rate is provably unusable &mdash; at 96-well it gives a 1.1&nbsp;&micro;L
+      total mix, 0.55&nbsp;&micro;L per tube, when RNAiMAX alone is 0.3&nbsp;&micro;L. Both are
+      plasmid-sheet leftovers.</div>
+  </section>
+
+  <!-- ============================================================ TESTS -->
+  <section id="s-tests">
+    <div class="hd"><h2>Validation</h2>
+      <p>The calculation core runs with no access to the page, so it can be checked independently.
+         These assertions run on load and on demand, and include parity against the source
+         workbook's own cell values.</p></div>
+    <div class="panel"><div class="t">Self-test<div class="r"><button onclick="renderTests()">Run again</button></div></div>
+      <div class="b"><div id="testOut"></div></div></div>
+  </section>
+
+  <!-- ============================================================ STUBS -->
+  <section id="s-seed"><div class="hd"><h2>Cell Seeding</h2></div>
+    <div class="stub"><h3>Phase 3</h3>
+      Seeding is deliberately kept separate from transfection arithmetic, sharing only experiment
+      metadata. The inputs it needs are already here: vessel area, per-line density
+      (HEK293T 52,100 and HeLa 28,906.25 cells/cm&sup2;, both unvalidated) and the plate layout.</div></section>
+
+  <section id="s-protocol"><div class="hd"><h2>Protocol</h2></div>
+    <div class="stub"><h3>Phase 3</h3>
+      Day&nbsp;-1 / Day&nbsp;0 / Day&nbsp;1-onward protocol generated from the layout. Calculated
+      quantities will be rendered distinctly from procedural steps, and no incubation time or
+      handling condition will be invented &mdash; anything absent from the workbook appears as a
+      marked placeholder awaiting your approval.</div></section>
+
+  <section id="s-export"><div class="hd"><h2>Documentation &amp; Export</h2></div>
+    <div class="stub"><h3>Phase 3 &mdash; JSON already works</h3>
+      JSON save and open are live now (Experiment Setup) because a layout you cannot keep between
+      sessions is not reviewable. Excel, CSV and PDF export, the lab worksheet for recording
+      actual values, and sample-ID generation follow in Phase 3.</div></section>
+
+  </main>
+</div>
+
+<script>
+"use strict";
+/* ========================================================================
+   UNITS  -  everything normalises to micromolar and microlitres
+   ======================================================================== */
+const U = {
+  toUM(v,u){ return u==="mM" ? v*1000 : u==="nM" ? v/1000 : v; },
+  fromUM(v,u){ return u==="mM" ? v/1000 : u==="nM" ? v*1000 : v; },
+  // Display a concentration in whichever unit reads most naturally.
+  conc(um){
+    if(um==null||!isFinite(um)) return "-";
+    if(um < 1) return trim(um*1000) + " nM";
+    if(um >= 1000) return trim(um/1000) + " mM";
+    return trim(um) + " µM";
+  },
+  vol(ul,dec){
+    if(ul==null||!isFinite(ul)) return "-";
+    if(Math.abs(ul) >= 1000) return trim(ul/1000,3) + " mL";
+    return ul.toFixed(dec==null?2:dec) + " µL";
+  }
+};
+function trim(n,d){ const s=(+n).toFixed(d==null?3:d); return s.replace(/\.?0+$/,""); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,c=>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+/* ========================================================================
+   FORMATS  -  vessel geometry
+   Areas are the workbook's own values. Only 96-well volumes are measured;
+   the rest are conventional working volumes with mix = 10% of total and
+   reagent = 0.30% v/v, both scaled from that one measured row.
+   ======================================================================== */
+function mkFmt(name,rows,cols,area,total,plate,measured){
+  return { name, rows, cols, area, plate,
+           media:+(total*0.9).toFixed(3),      // volume already in the well
+           part:+(total*0.05).toFixed(4),      // per tube; 2 tubes => 10% of total
+           reagent:+(total*0.003).toFixed(4),  // 0.30% v/v, from the 96-well measurement
+           measured:!!measured };
+}
+const BASE_FORMATS = [
+  mkFmt("384-well",16,24,0.056,50,true),
+  mkFmt("96-well",8,12,0.32,100,true,true),
+  mkFmt("48-well",6,8,1.1,250,true),
+  mkFmt("24-well",4,6,1.9,500,true),
+  mkFmt("12-well",3,4,3.5,1000,true),
+  mkFmt("6-well",2,3,9.6,2000,true),
+  mkFmt("35 mm dish",1,6,8.8,2000,false),
+  mkFmt("60 mm dish",1,6,21.5,4000,false),
+  mkFmt("100 mm dish",1,6,56.7,10000,false),
+  mkFmt("T-25 flask",1,6,25,5000,false),
+  mkFmt("T-75 flask",1,6,75,12000,false),
+  mkFmt("Custom",1,6,1,1000,false)
+];
+
+/* ========================================================================
+   METHODS
+   tubes          how many equal-volume tubes are combined
+   usesReagent    whether a lipid reagent is pipetted
+   usesDiluent    whether Opti-MEM (or similar) is used
+   Gymnotic uptake is genuinely different arithmetic, not a special case of
+   the lipid protocol - see CALC.perWell.
+   ======================================================================== */
+const METHODS = [
+  { id:"rnaimax",  name:"Lipofectamine RNAiMAX", tubes:2, usesReagent:true,  usesDiluent:true,
+    reagentName:"RNAiMAX", diluentName:"Opti-MEM" },
+  { id:"lipid",    name:"Other lipid reagent",   tubes:2, usesReagent:true,  usesDiluent:true,
+    reagentName:"Lipid reagent", diluentName:"Reduced-serum medium" },
+  { id:"gymnotic", name:"Gymnotic / free uptake",tubes:1, usesReagent:false, usesDiluent:false,
+    reagentName:"", diluentName:"" },
+  { id:"custom",   name:"Custom method",         tubes:2, usesReagent:true,  usesDiluent:true,
+    reagentName:"Reagent", diluentName:"Diluent" }
+];
+const method = id => METHODS.find(m=>m.id===id) || METHODS[0];
+
+/* ========================================================================
+   CALC  -  pure calculation core. No DOM. Every number on screen comes
+   from here, which is what makes the Validation page meaningful.
+   ======================================================================== */
+const CALC = {
+
+  /* Volume actually in the well, and the oligo volume needed for one well.
+     Lipid protocols: the mix volume is fixed by the protocol, so
+        Vfinal = media + tubes*part        and  Voligo = C*Vfinal/Cstock
+     Gymnotic: there is no carrier mix, the oligo goes straight in, so Vfinal
+     depends on Voligo. Solving  C = Cstock*Vo/(media+Vo)  gives
+        Vo = C*media/(Cstock - C)
+     Treating gymnotic as "lipid with zero reagent" would quietly use the
+     wrong final volume, which is why it is solved separately. */
+  perWell(o){
+    const m = method(o.methodId);
+    const Cs = o.stockUM, Cf = o.finalUM;
+    if(!(Cs>0) || !(Cf>0)) return { ok:false, reason:!(Cs>0)?"missing stock concentration":"zero target concentration" };
+    if(Cf >= Cs) return { ok:false, reason:"impossible dilution: target is at or above stock" };
+    let vFinal, vOligo, mixVol;
+    if(m.usesDiluent || m.usesReagent){
+      mixVol = m.tubes * o.part;
+      vFinal = o.media + mixVol;
+      vOligo = Cf * vFinal / Cs;
+      if(vOligo > o.part) return { ok:false, reason:"oligo volume exceeds its tube - raise tube volume or stock" };
+    } else {
+      vOligo = Cf * o.media / (Cs - Cf);
+      mixVol = vOligo;
+      vFinal = o.media + vOligo;
+    }
+    return { ok:true, m, vFinal, vOligo, mixVol,
+             reagent: m.usesReagent ? o.reagent : 0,
+             diluentA: m.usesDiluent ? o.part - vOligo : 0,
+             diluentB: m.usesDiluent && m.usesReagent ? o.part - o.reagent : 0,
+             tubeVol: m.usesDiluent ? o.part : vOligo,
+             pctReagent: m.usesReagent ? o.reagent / vFinal * 100 : 0 };
+  },
+
+  /* Effective well-equivalents: one rule for every component (decision D2). */
+  effWells(n, excessPct, deadWells){ return n * (1 + excessPct/100) + deadWells; },
+
+  /* Scale one condition to a master mix.
+     Diluent is BACK-CALCULATED from the rounded oligo volume so the tube total
+     stays exactly nEff*part - this is the workbook's own behaviour and worth
+     keeping, because it stops rounding drift accumulating into the total. */
+  masterMix(o, n, s){
+    const pw = CALC.perWell(o);
+    if(!pw.ok) return { ok:false, reason:pw.reason };
+    const d = s.decimals, nEff = CALC.effWells(n, s.excessPct, s.deadWells);
+    const r = x => +x.toFixed(d);
+    const out = { ok:true, n, nEff, pw, warnings:[] };
+
+    out.oligo = r(nEff * pw.vOligo);
+    if(pw.m.usesDiluent){
+      out.tubeA   = r(nEff * o.part);
+      out.diluentA= r(out.tubeA - out.oligo);
+      out.reagent = pw.m.usesReagent ? r(nEff * o.reagent) : 0;
+      out.tubeB   = pw.m.usesReagent ? r(nEff * o.part) : 0;
+      out.diluentB= pw.m.usesReagent ? r(out.tubeB - out.reagent) : 0;
+    } else {
+      out.tubeA = out.oligo; out.diluentA = 0;
+      out.reagent = 0; out.tubeB = 0; out.diluentB = 0;
+    }
+    out.total = out.tubeA + out.tubeB;
+    out.perWell = pw.mixVol;
+
+    // Concentration actually delivered after rounding - never assumed exact.
+    out.deliveredUM = out.oligo / nEff * o.stockUM / pw.vFinal;
+    out.concErrPct  = (out.deliveredUM / o.finalUM - 1) * 100;
+
+    // Warnings. A volume is never silently rounded away.
+    const chk = (v,label) => {
+      if(v === 0 && label.indexOf("oligo") === 0) out.warnings.push({lvl:"err",
+        msg:"The "+label+" rounds to zero at "+d+" decimal place"+(d===1?"":"s")+". Use an intermediate dilution."});
+      else if(v > 0 && v < s.minPipette) out.warnings.push({lvl:"warn",
+        msg:"The "+label+" is "+v.toFixed(Math.max(d,2))+" µL, below the "+s.minPipette+" µL minimum."});
+      if(v < 0) out.warnings.push({lvl:"err", msg:"Negative volume for "+label+" - inputs are inconsistent."});
+    };
+    chk(out.oligo,"oligo volume");
+    if(pw.m.usesDiluent) chk(out.diluentA,"diluent volume (oligo tube)");
+    if(pw.m.usesReagent){ chk(out.reagent,"reagent volume"); chk(out.diluentB,"diluent volume (reagent tube)"); }
+    if(pw.vOligo < s.minPipette) out.warnings.push({lvl:"info",
+      msg:"A single well would need "+pw.vOligo.toFixed(3)+" µL, below the "+s.minPipette+
+          " µL minimum. Fine as a master mix, but this condition cannot be pipetted one well at a time."});
+    if(pw.m.usesReagent && pw.pctReagent > 0.5) out.warnings.push({lvl:"warn",
+      msg:"Reagent is "+pw.pctReagent.toFixed(2)+"% v/v of final volume. Above roughly 0.5% expect toxicity."});
+
+    out.dilution = CALC.intermediate(o, out, s);
+    return out;
+  },
+
+  /* Propose an intermediate stock when the oligo volume is not pipettable.
+     Chooses the smallest round dilution factor that lifts the master-mix oligo
+     volume to at least 1 uL (comfortably above the 0.4 uL floor), then sizes
+     the intermediate so its own preparation is pipettable too. */
+  intermediate(o, mm, s){
+    const target = Math.max(s.minPipette * 2.5, 1);
+    if(mm.oligo >= target) return null;
+    if(!(mm.oligo > 0) && !(mm.pw.vOligo > 0)) return null;
+    const raw = mm.nEff * mm.pw.vOligo;
+    const need = target / raw;
+    const factors = [2,5,10,20,50,100,200,500,1000,2000,5000];
+    const D = factors.find(f => f >= need);
+    if(!D) return { impossible:true };
+    const newStock = o.stockUM / D;
+    if(newStock <= o.finalUM) return { impossible:true };
+    // Make enough intermediate for the mix plus a little, and at least 20 uL.
+    let vInt = Math.max(20, Math.ceil(raw * D * 1.5));
+    // The stock aliquot into the intermediate must itself clear the minimum.
+    if(vInt / D < s.minPipette) vInt = Math.ceil(s.minPipette * D);
+    return { factor:D, newStockUM:newStock, vInt,
+             fromStock:+(vInt/D).toFixed(2), diluent:+(vInt - vInt/D).toFixed(2),
+             mixVol:+(raw * D).toFixed(s.decimals) };
+  },
+
+  /* Group wells into master mixes. Two wells share a mix only when every
+     variable in the key matches (brief section 7). */
+  groupKey(w, plate, oligo, fmt){
+    return [ w.oligoId, oligo?oligo.chemistry:"", oligo?oligo.stockConc+oligo.stockUnit:"",
+             w.concUnit==="nM"? w.conc/1000 : w.conc,
+             plate.methodId, fmt.reagent, fmt.media, fmt.part, fmt.name ].join("|");
+  }
+};
+
+/* ========================================================================
+   STATE
+   ======================================================================== */
+const LS = "txplanner.v1";
+let S = null, sel = new Set(), clip = null, vizMode = "oligo", lastAnchor = null;
+
+function defaults(){
+  return { excessPct:10, deadWells:1, minPipette:0.4, decimals:1, numberingScope:"experiment" };
+}
+function blankWell(){ return { oligoId:"", conc:null, concUnit:"µM", group:"", control:"",
+                               bioRep:null, techRep:null, timepoint:null, note:"" }; }
+function newPlate(n){
+  return { id:"P"+n, format:"96-well", vesselCount:6, cellLine:"HeLa",
+           methodId:"rnaimax", timepoint:72, notes:"", wells:{} };
+}
+function newExperiment(){
+  S = { meta:{ name:"", id:"EXP-"+new Date().toISOString().slice(0,10).replace(/-/g,""),
+               researcher:"", date:new Date().toISOString().slice(0,10),
+               cellLine:"HeLa", passage:"", seedDate:"", txDate:"", harvestDate:"",
+               harvestTime:"", purpose:"", notes:"" },
+       settings: defaults(),
+       formats: JSON.parse(JSON.stringify(BASE_FORMATS)),
+       cellLines: [ {name:"HEK293T", density:52100,    validated:false},
+                    {name:"HeLa",    density:28906.25, validated:false} ],
+       oligos: [], plates: [ newPlate(1) ], active:0 };
+  sel.clear(); save(); renderAll();
+}
+
+/* The workbook's own experiment, so the prototype can be checked against
+   numbers Chris already knows. Labelled as an example, not a validated default. */
+function loadExample(){
+  newExperiment();
+  S.meta.name = "ASO dose-response (workbook example)";
+  S.meta.researcher = "C. Dooley";
+  S.meta.purpose = "Reproduces the volumes in ASO_TransfectionHepG2_curve.xlsx so new numbers "+
+                   "can be checked against the sheet. Oligo names here are placeholders - load "+
+                   "your local oligos.json for real identities. Example settings, not validated defaults.";
+  // Placeholder identities only. The arithmetic is identical whatever the oligo
+  // is called, so parity with the workbook is preserved without shipping any
+  // real sequence, name or exon target in a file that may be published.
+  S.oligos = [
+    { id:"o1", name:"Scrambled", label:"chemistry control", chemistry:"steric", stockConc:400, stockUnit:"µM", seq:"", notes:"ASO-chemistry control" },
+    { id:"o2", name:"Oligo_A",   label:"",                  chemistry:"steric", stockConc:400, stockUnit:"µM", seq:"", notes:"" },
+    { id:"o3", name:"Oligo_B",   label:"",                  chemistry:"steric", stockConc:400, stockUnit:"µM", seq:"", notes:"" },
+    { id:"o4", name:"Oligo_C",   label:"",                  chemistry:"steric", stockConc:400, stockUnit:"µM", seq:"", notes:"" }
+  ];
+  const p = S.plates[0];
+  p.id = "P1"; p.cellLine = "HeLa"; p.timepoint = 72;
+  p.notes = "4 replicate columns per condition, as in the ORDER sheet left grid.";
+  // 8 conditions down the rows, 4 replicate columns (cols 3-6), mirroring ORDER.
+  const map = [S.oligos[0],S.oligos[1],S.oligos[2],S.oligos[3]];
+  for(let r=0;r<8;r++){
+    const o = map[r%4], boil = r>=4;
+    for(let c=3;c<=6;c++){
+      const w = blankWell();
+      w.oligoId=o.id; w.conc=2.5; w.concUnit="µM";
+      w.group = o.name + (boil?" / variant":"");
+      w.control = (o.name==="Scrambled") ? "scrambled" : "";
+      w.techRep = c-2; w.bioRep = 1; w.timepoint = 72;
+      if(boil) w.note = "workbook strip labelled ‘Boil’ — protocol not recorded";
+      p.wells[ "ABCDEFGH"[r] + c ] = w;
+    }
+  }
+  save(); renderAll();
+}
+
+function save(){ try{ localStorage.setItem(LS, JSON.stringify(S)); }catch(e){} }
+function load(){
+  try{ const r = localStorage.getItem(LS); if(!r) return false;
+       const o = JSON.parse(r); if(!o || !o.plates) return false; S = o;
+       S.settings = Object.assign(defaults(), S.settings||{}); return true;
+  }catch(e){ return false; }
+}
+const plate = () => S.plates[S.active];
+const fmtOf = p => S.formats.find(f=>f.name===p.format) || S.formats[1];
+const oligoOf = id => S.oligos.find(o=>o.id===id) || null;
+const oligoLabel = o => o ? (o.name + (o.label? " · "+o.label : "")) : "";
+
+/* ========================================================================
+   PLATE geometry and selection
+   ======================================================================== */
+function dims(p){
+  const f = fmtOf(p);
+  return f.plate ? {rows:f.rows, cols:f.cols, plate:true}
+                 : {rows:1, cols:Math.max(1, p.vesselCount||6), plate:false};
+}
+const rowName = i => i<26 ? "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[i]
+                          : "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[Math.floor(i/26)-1]+"ABCDEFGHIJKLMNOPQRSTUVWXYZ"[i%26];
+function wellIds(p){
+  const d = dims(p), out = [];
+  for(let r=0;r<d.rows;r++) for(let c=1;c<=d.cols;c++)
+    out.push(d.plate ? rowName(r)+c : "V"+c);
+  return out;
+}
+function wellPos(p,id){
+  const d = dims(p);
+  if(!d.plate) return { r:0, c:parseInt(id.slice(1),10) };
+  const m = id.match(/^([A-Z]+)(\d+)$/);
+  return { r:"ABCDEFGHIJKLMNOPQRSTUVWXYZ".indexOf(m[1]), c:+m[2] };
+}
+const getW = (p,id) => p.wells[id] || null;
+function ensureW(p,id){ if(!p.wells[id]) p.wells[id] = blankWell(); return p.wells[id]; }
+const isEmptyW = w => !w || (!w.oligoId && !w.control && w.conc==null && !w.group && !w.note);
+
+function selAll(){ sel = new Set(wellIds(plate())); paint(); }
+function selNone(){ sel.clear(); paint(); }
+function selInvert(){ const a=wellIds(plate()); const n=new Set(); a.forEach(i=>{ if(!sel.has(i)) n.add(i); }); sel=n; paint(); }
+function selUnassigned(){ const p=plate(); sel=new Set(wellIds(p).filter(i=>isEmptyW(getW(p,i)))); paint(); }
+
+/* ========================================================================
+   UI  -  rendering
+   ======================================================================== */
+function renderAll(){
+  renderMeta(); renderOligos(); renderPlateTabs(); renderPlateProps();
+  renderModes(); paint(); renderCalcInputs(); renderCalc(); renderMixes();
+  renderFormats(); renderStats(); renderTests();
+}
+
+/* ---- metadata ---- */
+function renderMeta(){
+  const m = S.meta, g = id => document.getElementById(id);
+  g("m_name").value=m.name; g("m_id").value=m.id; g("m_res").value=m.researcher;
+  g("m_date").value=m.date; g("m_pass").value=m.passage; g("m_seedD").value=m.seedDate;
+  g("m_txD").value=m.txD||m.txDate||""; g("m_hvD").value=m.harvestDate;
+  g("m_hvT").value=m.harvestTime; g("m_purp").value=m.purpose; g("m_notes").value=m.notes;
+  const cs = S.cellLines.map(c=>`<option ${c.name===m.cellLine?"selected":""}>${esc(c.name)}</option>`).join("");
+  g("m_cell").innerHTML = cs;
+  ["p_cell"].forEach(i=>{ const e=g(i); if(e) e.innerHTML=cs; });
+  const s = S.settings;
+  g("g_exc").value=s.excessPct; g("g_dead").value=s.deadWells;
+  g("g_min").value=s.minPipette; g("g_dec").value=s.decimals; g("g_scope").value=s.numberingScope;
+  g("topId").textContent = (m.id||"-") + (m.name? "  ·  "+m.name : "");
+  g("cellNote").innerHTML = S.cellLines.map(c =>
+    `<div class="note ${c.validated?"k":"w"}" style="margin:8px 0 0"><b>${esc(c.name)}</b> &mdash;
+     ${c.density.toLocaleString()} cells/cm&sup2;. ${c.validated ? "Marked validated."
+     : "<b>Unvalidated.</b> " + (c.name==="HeLa"
+        ? "28,906.25 back-solves exactly to 9,250 cells in a 96-well, so it looks derived from a target well count rather than measured."
+        : "Carried over from the workbook without a recorded source.")}</div>`).join("");
+}
+function bindMeta(){
+  const b = (id,k,f) => { const e=document.getElementById(id);
+    e.addEventListener("input",()=>{ S.meta[k] = f?f(e.value):e.value;
+      if(k==="id"||k==="name") document.getElementById("topId").textContent=(S.meta.id||"-")+(S.meta.name?"  ·  "+S.meta.name:"");
+      save(); }); };
+  b("m_name","name"); b("m_id","id"); b("m_res","researcher"); b("m_date","date");
+  b("m_pass","passage"); b("m_seedD","seedDate"); b("m_txD","txDate");
+  b("m_hvD","harvestDate"); b("m_hvT","harvestTime"); b("m_purp","purpose"); b("m_notes","notes");
+  document.getElementById("m_cell").addEventListener("change",e=>{ S.meta.cellLine=e.target.value; save(); });
+  const sb = (id,k,num) => document.getElementById(id).addEventListener("input",e=>{
+    S.settings[k] = num ? (parseFloat(e.target.value)||0) : e.target.value;
+    save(); renderCalc(); renderMixes(); renderStats(); });
+  sb("g_exc","excessPct",1); sb("g_dead","deadWells",1); sb("g_min","minPipette",1);
+  sb("g_dec","decimals",1); sb("g_scope","numberingScope",0);
+}
+function addCellLine(){
+  const n = document.getElementById("m_newCell").value.trim();
+  const d = parseFloat(document.getElementById("m_newDens").value);
+  if(!n || !(d>0)) { alert("Give the line a name and a density in cells/cm²."); return; }
+  if(S.cellLines.some(c=>c.name.toLowerCase()===n.toLowerCase())){ alert("That line already exists."); return; }
+  S.cellLines.push({name:n, density:d, validated:true});
+  document.getElementById("m_newCell").value=""; document.getElementById("m_newDens").value="";
+  save(); renderMeta(); renderPlateProps();
+}
+
+/* ---- oligos ---- */
+function renderOligos(){
+  const rows = S.oligos.map(o=>`<tr>
+    <td><input value="${esc(o.name)}" oninput="setOl('${o.id}','name',this.value)" style="width:110px"></td>
+    <td><input value="${esc(o.label||"")}" oninput="setOl('${o.id}','label',this.value)" style="width:140px"></td>
+    <td><select onchange="setOl('${o.id}','chemistry',this.value)" style="width:150px">
+      ${["steric","exon-skipping","gapmer","other"].map(c=>
+        `<option value="${c}" ${o.chemistry===c?"selected":""}>${
+         c==="steric"?"Steric-blocking":c==="exon-skipping"?"Exon-skipping":
+         c==="gapmer"?"RNase H gapmer":"Other"}</option>`).join("")}</select></td>
+    <td class="n"><input type="number" step="any" value="${o.stockConc}" style="width:84px"
+        oninput="setOl('${o.id}','stockConc',parseFloat(this.value))"></td>
+    <td><select onchange="setOl('${o.id}','stockUnit',this.value)" style="width:68px">
+      <option ${o.stockUnit==="µM"?"selected":""}>µM</option>
+      <option ${o.stockUnit==="mM"?"selected":""}>mM</option></select></td>
+    <td class="n">${U.conc(U.toUM(o.stockConc,o.stockUnit))}</td>
+    <td class="num" style="font-size:11px">${esc(o.seq||"")||'<span class="hint">&mdash;</span>'}</td>
+    <td class="n">${usageOf(o.id)}</td>
+    <td><input value="${esc(o.notes||"")}" oninput="setOl('${o.id}','notes',this.value)"></td>
+    <td><button class="d" onclick="delOligo('${o.id}')">Remove</button></td></tr>`).join("");
+  document.getElementById("oligoTbl").innerHTML =
+    `<thead><tr><th>Name</th><th>Label</th><th>Chemistry</th><th class="n">Stock</th><th>Unit</th>
+     <th class="n">Normalised</th><th>Sequence</th><th class="n">Wells</th><th>Notes</th><th></th></tr></thead>
+     <tbody>${rows || `<tr><td colspan="10" class="hint">No oligos yet. Add one, or reload the workbook example from Experiment Setup.</td></tr>`}</tbody>`;
+
+  renderLibrary();
+}
+
+/* ========================================================================
+   OLIGO LIBRARY
+   Sequences are DELIBERATELY not in this file. They live in a separate
+   oligos.json that the user loads, and which is .gitignore'd, so the
+   application can be published without publishing unfiled ASO sequences.
+   Kept in its own localStorage key so it survives switching experiments.
+   ======================================================================== */
+const LIBKEY = "txplanner.library.v1";
+let LIB = [];
+function loadLibraryFromStore(){
+  try{ const r=localStorage.getItem(LIBKEY); LIB = r? JSON.parse(r) : []; }catch(e){ LIB=[]; }
+}
+function saveLibrary(){ try{ localStorage.setItem(LIBKEY, JSON.stringify(LIB)); }catch(e){} }
+function setLibrary(arr){
+  if(!Array.isArray(arr)) throw new Error("expected a JSON array of oligos");
+  LIB = arr.filter(o=>o && o.name).map(o=>({
+    name:String(o.name), label:o.label?String(o.label):"",
+    chemistry:o.chemistry||"steric",
+    stockConc:parseFloat(o.stockConc)||400, stockUnit:o.stockUnit||"µM",
+    seq:o.seq?String(o.seq).toUpperCase().replace(/\s+/g,""):"",
+    notes:o.notes?String(o.notes):"" }));
+  saveLibrary(); renderLibrary(); renderOligos();
+}
+function importLibrary(input){
+  const f=input.files[0]; if(!f) return;
+  const r=new FileReader();
+  r.onload=()=>{ try{ const d=JSON.parse(r.result);
+      setLibrary(Array.isArray(d)? d : d.oligos);
+    }catch(e){ alert("Could not read that library: "+e.message); }
+    input.value=""; };
+  r.readAsText(f);
+}
+function exportLibrary(){
+  if(!LIB.length){ alert("No library loaded."); return; }
+  const blob=new Blob([JSON.stringify(LIB,null,2)],{type:"application/json"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+  a.download="oligos.json"; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
+function clearLibrary(){
+  if(!LIB.length) return;
+  if(!confirm("Forget the oligo library held in this browser? Your oligos.json file is untouched.")) return;
+  LIB=[]; saveLibrary(); renderLibrary(); renderOligos();
+}
+function addFromLibrary(i){
+  const o=LIB[i]; if(!o) return;
+  S.oligos.push(Object.assign({id:"o"+Date.now().toString(36)+Math.random().toString(36).slice(2,5)},o));
+  save(); renderOligos(); renderAssignOptions();
+}
+function renderLibrary(){
+  const st=document.getElementById("libStatus"), ls=document.getElementById("libList"),
+        dz=document.getElementById("libDrop");
+  if(!st) return;
+  if(!LIB.length){
+    st.innerHTML = `<div class="note w"><b>No oligo library loaded.</b> Real sequences are kept
+      out of this file on purpose, so the application can be shared or published without
+      publishing them. Load your <code>oligos.json</code> to populate the list. The planner works
+      fine without it &mdash; sequences are reference data and no calculation uses them.</div>`;
+    ls.innerHTML=""; dz.style.display="block"; return;
+  }
+  dz.style.display="none";
+  st.innerHTML = `<div class="note k"><b>${LIB.length} oligos loaded</b> from your local library,
+    held in this browser only. Nothing here is written into the application file.</div>`;
+  ls.innerHTML = `<table><thead><tr><th>Name</th><th>Label</th><th>Sequence</th><th class="n">nt</th>
+    <th>Chemistry</th><th class="n">Stock</th><th></th></tr></thead><tbody>` +
+    LIB.map((o,i)=>`<tr><td class="num">${esc(o.name)}</td><td>${esc(o.label)}</td>
+      <td class="num" style="font-size:11.5px">${esc(o.seq)||'<span class="hint">-</span>'}</td>
+      <td class="n">${o.seq?o.seq.length:""}</td><td class="hint">${esc(o.chemistry)}</td>
+      <td class="n">${trim(o.stockConc)} ${esc(o.stockUnit)}</td>
+      <td><button onclick="addFromLibrary(${i})">Use</button></td></tr>`).join("") + `</tbody></table>`;
+}
+/* Drag-and-drop, because a file picker is one click too many mid-experiment. */
+function wireLibDrop(){
+  const dz=document.getElementById("libDrop"); if(!dz) return;
+  ["dragenter","dragover"].forEach(e=>dz.addEventListener(e,ev=>{
+    ev.preventDefault(); dz.style.borderColor="#3b9ab2"; dz.style.background="#eff7fa"; }));
+  ["dragleave","drop"].forEach(e=>dz.addEventListener(e,ev=>{
+    ev.preventDefault(); dz.style.borderColor=""; dz.style.background=""; }));
+  dz.addEventListener("drop",ev=>{
+    const f=ev.dataTransfer.files[0]; if(!f) return;
+    const r=new FileReader();
+    r.onload=()=>{ try{ const d=JSON.parse(r.result); setLibrary(Array.isArray(d)?d:d.oligos); }
+                   catch(e){ alert("Could not read that library: "+e.message); } };
+    r.readAsText(f);
+  });
+}
+/* When served over http(s) - a lab share or GitHub Pages - pick up an
+   oligos.json sitting next to index.html automatically. Silently skipped on
+   file://, where browsers block the fetch, and never an error if absent. */
+async function autoLoadLibrary(){
+  if(LIB.length) return;
+  if(!/^https?:$/.test(location.protocol)) return;
+  try{
+    const r=await fetch("oligos.json",{cache:"no-store"});
+    if(!r.ok) return;
+    const d=await r.json();
+    setLibrary(Array.isArray(d)?d:d.oligos);
+  }catch(e){ /* absent or blocked - expected, not an error */ }
+}
+function usageOf(id){ let n=0; S.plates.forEach(p=>Object.values(p.wells).forEach(w=>{ if(w.oligoId===id) n++; })); return n; }
+function setOl(id,k,v){ const o=oligoOf(id); if(!o) return; o[k]=v; save();
+  if(k==="stockConc"||k==="stockUnit"||k==="chemistry"){ renderMixes(); renderStats(); }
+  if(k==="name"||k==="label"){ renderAssignOptions(); paint(); } }
+function addOligo(){
+  S.oligos.push({ id:"o"+Date.now().toString(36), name:"ASO_", label:"", chemistry:"steric",
+                  stockConc:400, stockUnit:"µM", seq:"", notes:"" });
+  save(); renderOligos(); renderAssignOptions();
+}
+function delOligo(id){
+  const n = usageOf(id);
+  if(n && !confirm("This oligo is assigned to "+n+" well(s). Remove it and clear those wells?")) return;
+  S.plates.forEach(p=>Object.values(p.wells).forEach(w=>{ if(w.oligoId===id) w.oligoId=""; }));
+  S.oligos = S.oligos.filter(o=>o.id!==id);
+  save(); renderOligos(); renderAssignOptions(); paint(); renderMixes(); renderStats();
+}
+
+/* ---- plate tabs and properties ---- */
+function renderPlateTabs(){
+  document.getElementById("ptabs").innerHTML = S.plates.map((p,i)=>
+    `<div class="pt ${i===S.active?"on":""}" onclick="pickPlate(${i})">${esc(p.id)}
+      <span style="opacity:.6">${esc(p.format)}</span></div>`).join("");
+}
+function pickPlate(i){ S.active=i; sel.clear(); save(); renderPlateTabs(); renderPlateProps(); paint(); }
+function addPlate(){ S.plates.push(newPlate(S.plates.length+1)); S.active=S.plates.length-1;
+  sel.clear(); save(); renderPlateTabs(); renderPlateProps(); paint(); renderMixes(); renderStats(); }
+function dupPlate(){ const c=JSON.parse(JSON.stringify(plate())); c.id="P"+(S.plates.length+1);
+  S.plates.push(c); S.active=S.plates.length-1; save();
+  renderPlateTabs(); renderPlateProps(); paint(); renderMixes(); renderStats(); }
+function delPlate(){ if(S.plates.length===1){ alert("An experiment needs at least one plate."); return; }
+  if(!confirm("Delete "+plate().id+" and everything on it?")) return;
+  S.plates.splice(S.active,1); S.active=0; sel.clear(); save();
+  renderPlateTabs(); renderPlateProps(); paint(); renderMixes(); renderStats(); }
+
+function renderPlateProps(){
+  const p = plate(), g = id=>document.getElementById(id);
+  g("p_id").value=p.id;
+  g("p_fmt").innerHTML = S.formats.map(f=>`<option ${f.name===p.format?"selected":""}>${esc(f.name)}</option>`).join("");
+  g("p_cell").innerHTML = S.cellLines.map(c=>`<option ${c.name===p.cellLine?"selected":""}>${esc(c.name)}</option>`).join("");
+  g("p_meth").innerHTML = METHODS.map(m=>`<option value="${m.id}" ${m.id===p.methodId?"selected":""}>${esc(m.name)}</option>`).join("");
+  g("p_tp").value = p.timepoint==null?"":p.timepoint;
+  g("p_notes").value = p.notes;
+  g("p_vc").value = p.vesselCount;
+  const f = fmtOf(p);
+  g("p_vcWrap").style.display = f.plate ? "none" : "block";
+  const m = method(p.methodId), pw = f.media + (m.usesDiluent? m.tubes*f.part : 0);
+  g("fmtInfo").innerHTML = `<div class="note ${f.measured?"k":"w"}" style="margin-top:11px">
+     <b>${esc(f.name)}</b> &middot; ${f.area} cm&sup2; &middot; media ${U.vol(f.media,1)}
+     ${m.usesDiluent?`&middot; mix ${m.tubes} &times; ${U.vol(f.part,2)} = ${U.vol(m.tubes*f.part,1)}
+     &middot; <b>final ${U.vol(pw,1)}</b>`:`&middot; oligo added directly, final volume depends on dose`}
+     ${m.usesReagent?`&middot; ${esc(m.reagentName)} ${U.vol(f.reagent,2)} (${(f.reagent/pw*100).toFixed(2)}% v/v)`:""}
+     <br>${f.measured ? "Measured values, reproducing the workbook exactly."
+       : "Derived by scaling from the measured 96-well row. Starting point, not a validated lab value."}</div>`;
+}
+function bindPlateProps(){
+  const p = ()=>plate();
+  document.getElementById("p_id").addEventListener("input",e=>{ p().id=e.target.value; save(); renderPlateTabs(); });
+  document.getElementById("p_fmt").addEventListener("change",e=>{ p().format=e.target.value; sel.clear();
+    save(); renderPlateProps(); paint(); renderMixes(); renderStats(); });
+  document.getElementById("p_vc").addEventListener("input",e=>{ p().vesselCount=Math.max(1,parseInt(e.target.value)||1);
+    save(); paint(); renderMixes(); renderStats(); });
+  document.getElementById("p_cell").addEventListener("change",e=>{ p().cellLine=e.target.value; save(); });
+  document.getElementById("p_meth").addEventListener("change",e=>{ p().methodId=e.target.value;
+    save(); renderPlateProps(); renderMixes(); renderStats(); });
+  document.getElementById("p_tp").addEventListener("input",e=>{ p().timepoint=e.target.value===""?null:+e.target.value; save(); });
+  document.getElementById("p_notes").addEventListener("input",e=>{ p().notes=e.target.value; save(); });
+}
+
+/* ---- visualisation ---- */
+const MODES = [["oligo","Oligo"],["conc","Concentration"],["group","Group"],
+               ["rep","Replicate"],["time","Timepoint"]];
+function renderModes(){
+  document.getElementById("modes").innerHTML = MODES.map(m=>
+    `<button class="${vizMode===m[0]?"on":""}" onclick="vizMode='${m[0]}';renderModes();paint()">${m[1]}</button>`).join("");
+}
+const PALETTE = ["#3b9ab2","#e1af00","#b33a1e","#3b7a57","#7b6ca8","#d1703c","#4d7ea8",
+                 "#9a9a3f","#a8556f","#5f9e8f","#8c6d3f","#6b7f9e"];
+function colorFor(key, keys){
+  if(key==null||key==="") return null;
+  const i = keys.indexOf(key);
+  return i<0 ? "#9a9892" : PALETTE[i % PALETTE.length];
+}
+function wellKey(w){
+  if(!w) return null;
+  switch(vizMode){
+    case "oligo": { const o=oligoOf(w.oligoId); return o?o.name:(w.control?("ctl: "+w.control):null); }
+    case "conc":  return w.conc==null?null:U.conc(w.concUnit==="nM"?w.conc/1000:w.conc);
+    case "group": return w.group||null;
+    case "rep":   return (w.bioRep||w.techRep)? ("bio "+(w.bioRep||"-")+" / tech "+(w.techRep||"-")) : null;
+    case "time":  return w.timepoint==null?null:(String(w.timepoint).padStart(3,"0")+" h");
+  }
+  return null;
+}
+function wellShort(w){
+  if(!w) return "";
+  switch(vizMode){
+    case "oligo": { const o=oligoOf(w.oligoId); return o? o.name.replace(/^ASO_?/,"") : (w.control? w.control.slice(0,3) : ""); }
+    case "conc":  return w.conc==null?"":trim(w.conc,2);
+    case "group": return (w.group||"").slice(0,4);
+    case "rep":   return (w.techRep!=null? "t"+w.techRep : "") || (w.bioRep!=null? "b"+w.bioRep : "");
+    case "time":  return w.timepoint==null?"":w.timepoint+"h";
+  }
+  return "";
+}
+
+/* ---- the grid ---- */
+let dragging=false, dragStart=null, dragAdd=true;
+function paint(){
+  const p = plate(), d = dims(p), ids = wellIds(p);
+  const keys = [...new Set(ids.map(i=>wellKey(getW(p,i))).filter(Boolean))].sort();
+  let h = "<table class='plate'><thead><tr><th class='rh'></th>";
+  for(let c=1;c<=d.cols;c++) h += `<th class="sel" onclick="selCol(${c},event)">${d.plate?c:"V"+c}</th>`;
+  h += "</tr></thead><tbody>";
+  for(let r=0;r<d.rows;r++){
+    h += `<tr><th class="rh sel" onclick="selRow(${r},event)">${d.plate?rowName(r):""}</th>`;
+    for(let c=1;c<=d.cols;c++){
+      const id = d.plate ? rowName(r)+c : "V"+c, w = getW(p,id);
+      const k = wellKey(w), col = colorFor(k,keys);
+      const st = col ? `background:${col};` : "";
+      h += `<td class="w ${col?"has":""} ${sel.has(id)?"sel":""} ${w&&w.control?"ctl":""}"
+              style="${st}" data-id="${id}" title="${esc(tipFor(p,id,w))}">${esc(wellShort(w))}</td>`;
+    }
+    h += "</tr>";
+  }
+  document.getElementById("plateWrap").innerHTML = h + "</tbody></table>";
+
+  document.getElementById("legend").innerHTML = keys.length
+    ? keys.map(k=>`<div class="it"><div class="sw" style="background:${colorFor(k,keys)}"></div>${esc(k)}</div>`).join("")
+      + `<div class="it"><div class="sw" style="background:#fff"></div>unassigned</div>`
+      + `<div class="it"><div class="sw" style="background:#fff;position:relative"><span style="position:absolute;left:0;top:0;border-top:5px solid rgba(0,0,0,.45);border-right:5px solid transparent"></span></div>control</div>`
+    : `<div class="hint">Nothing assigned on this plate yet.</div>`;
+
+  const n = sel.size;
+  document.getElementById("selCount").innerHTML = n
+    ? `<b>${n}</b> well${n===1?"":"s"} selected.`
+    : `No wells selected. Click, drag, shift-click, or use a row or column header.`;
+  wireGrid();
+  renderStats();
+}
+function tipFor(p,id,w){
+  if(!w) return id+" - empty";
+  const o = oligoOf(w.oligoId);
+  const bits = [id];
+  if(o) bits.push(oligoLabel(o));
+  if(w.conc!=null) bits.push(trim(w.conc)+" "+w.concUnit);
+  if(w.control) bits.push("control: "+w.control);
+  if(w.group) bits.push("group: "+w.group);
+  if(w.bioRep!=null||w.techRep!=null) bits.push("bio "+(w.bioRep||"-")+" / tech "+(w.techRep||"-"));
+  if(w.timepoint!=null) bits.push(w.timepoint+" h");
+  if(w.note) bits.push(w.note);
+  return bits.join("  |  ");
+}
+function wireGrid(){
+  const wrap = document.getElementById("plateWrap");
+  wrap.querySelectorAll("td.w").forEach(td=>{
+    td.addEventListener("mousedown",e=>{
+      e.preventDefault();
+      const id = td.dataset.id;
+      if(e.shiftKey && lastAnchor){ rangeSel(lastAnchor,id); paint(); return; }
+      dragging = true; dragStart = id; dragAdd = !(e.metaKey||e.ctrlKey) ? true : !sel.has(id);
+      if(!(e.metaKey||e.ctrlKey)) sel.clear();
+      dragAdd ? sel.add(id) : sel.delete(id);
+      lastAnchor = id; paint();
+    });
+    td.addEventListener("mouseenter",()=>{ if(dragging){ rangeSel(dragStart, td.dataset.id); paint(); } });
+  });
+}
+document.addEventListener("mouseup",()=>{ dragging=false; });
+function rangeSel(a,b){
+  const p = plate(), pa = wellPos(p,a), pb = wellPos(p,b), d = dims(p);
+  const r0=Math.min(pa.r,pb.r), r1=Math.max(pa.r,pb.r), c0=Math.min(pa.c,pb.c), c1=Math.max(pa.c,pb.c);
+  for(let r=r0;r<=r1;r++) for(let c=c0;c<=c1;c++)
+    sel.add(d.plate ? rowName(r)+c : "V"+c);
+}
+function selRow(r,e){ const p=plate(), d=dims(p); if(!(e.metaKey||e.ctrlKey||e.shiftKey)) sel.clear();
+  for(let c=1;c<=d.cols;c++) sel.add(d.plate?rowName(r)+c:"V"+c); paint(); }
+function selCol(c,e){ const p=plate(), d=dims(p); if(!(e.metaKey||e.ctrlKey||e.shiftKey)) sel.clear();
+  for(let r=0;r<d.rows;r++) sel.add(d.plate?rowName(r)+c:"V"+c); paint(); }
+
+/* ---- assignment ---- */
+function renderAssignOptions(){
+  const cur = document.getElementById("a_oligo").value;
+  document.getElementById("a_oligo").innerHTML =
+    `<option value="">(leave unchanged)</option><option value="__none">(no oligo)</option>` +
+    S.oligos.map(o=>`<option value="${o.id}" ${o.id===cur?"selected":""}>${esc(oligoLabel(o))}</option>`).join("");
+}
+function applyAssign(){
+  if(!sel.size){ alert("Select some wells first."); return; }
+  const p = plate(), g = id=>document.getElementById(id).value;
+  const oid=g("a_oligo"), conc=g("a_conc"), cu=g("a_cu"), grp=g("a_grp"), ctl=g("a_ctl"),
+        bio=g("a_bio"), tech=g("a_tech"), tp=g("a_tp"), note=g("a_note");
+  sel.forEach(id=>{
+    const w = ensureW(p,id);
+    if(oid==="__none") w.oligoId=""; else if(oid) w.oligoId=oid;
+    if(conc!==""){ w.conc=parseFloat(conc); w.concUnit=cu; }
+    if(grp!=="") w.group=grp;
+    if(document.getElementById("a_ctl").selectedIndex>0 || ctl==="") w.control=ctl;
+    if(bio!=="") w.bioRep=parseInt(bio);
+    if(tech!=="") w.techRep=parseInt(tech);
+    if(tp!=="") w.timepoint=parseFloat(tp);
+    if(note!=="") w.note=note;
+  });
+  save(); paint(); renderMixes(); renderOligos();
+}
+function clearSel(){
+  if(!sel.size) return;
+  const p = plate(); sel.forEach(id=>{ delete p.wells[id]; });
+  save(); paint(); renderMixes(); renderOligos();
+}
+function copyWell(){
+  if(sel.size!==1){ alert("Select exactly one well to copy."); return; }
+  const w = getW(plate(), [...sel][0]);
+  if(!w){ alert("That well is empty."); return; }
+  clip = JSON.parse(JSON.stringify(w));
+}
+function pasteWell(){
+  if(!clip){ alert("Nothing copied yet."); return; }
+  if(!sel.size){ alert("Select the wells to paste into."); return; }
+  const p = plate();
+  sel.forEach(id=>{ p.wells[id] = JSON.parse(JSON.stringify(clip)); });
+  save(); paint(); renderMixes(); renderOligos();
+}
+function applyGradient(){
+  if(sel.size<2){ alert("Select at least two wells for a series."); return; }
+  const hi=parseFloat(document.getElementById("d_hi").value),
+        lo=parseFloat(document.getElementById("d_lo").value),
+        scale=document.getElementById("d_scale").value,
+        unit=document.getElementById("d_cu").value,
+        dir=document.getElementById("d_dir").value;
+  if(!(hi>0)||!(lo>0)){ alert("Both ends of the series must be greater than zero."); return; }
+  if(scale==="log" && (hi<=0||lo<=0)){ alert("A log series needs positive values at both ends."); return; }
+  const p = plate();
+  const ids = [...sel].sort((a,b)=>{
+    const A=wellPos(p,a), B=wellPos(p,b);
+    return dir==="col" ? (A.c-B.c)||(A.r-B.r) : (A.r-B.r)||(A.c-B.c);
+  });
+  // Distinct steps across the ordered positions, so replicates at the same
+  // position share a concentration rather than each getting its own step.
+  const posKey = id => { const q=wellPos(p,id); return dir==="col"? q.c : q.r; };
+  const steps = [...new Set(ids.map(posKey))];
+  const n = steps.length;
+  ids.forEach(id=>{
+    const k = steps.indexOf(posKey(id));
+    const t = n===1 ? 0 : k/(n-1);
+    const v = scale==="log" ? hi*Math.pow(lo/hi,t) : hi+(lo-hi)*t;
+    const w = ensureW(p,id);
+    w.conc = +v.toPrecision(4); w.concUnit = unit;
+  });
+  save(); paint(); renderMixes();
+}
+function autoReps(){
+  if(!sel.size){ alert("Select some wells first."); return; }
+  const p = plate(), what=document.getElementById("r_what").value,
+        dir=document.getElementById("r_dir").value;
+  const buckets = {};
+  [...sel].forEach(id=>{ const q=wellPos(p,id); const k = dir==="row"? q.r : q.c;
+    (buckets[k] = buckets[k]||[]).push(id); });
+  Object.values(buckets).forEach(list=>{
+    list.sort((a,b)=>{ const A=wellPos(p,a),B=wellPos(p,b); return dir==="row"? A.c-B.c : A.r-B.r; });
+    list.forEach((id,i)=>{ const w=ensureW(p,id); if(what==="tech") w.techRep=i+1; else w.bioRep=i+1; });
+  });
+  save(); paint();
+}
+
+/* ---- single-condition calculator ---- */
+function renderCalcInputs(){
+  const g = id=>document.getElementById(id);
+  g("c_fmt").innerHTML = S.formats.map(f=>`<option ${f.name==="96-well"?"selected":""}>${esc(f.name)}</option>`).join("");
+  g("c_meth").innerHTML = METHODS.map(m=>`<option value="${m.id}">${esc(m.name)}</option>`).join("");
+  const f = S.formats.find(x=>x.name==="96-well");
+  g("c_stock").value=400; g("c_su").value="µM"; g("c_n").value=32;
+  g("c_final").value=2.5; g("c_fu").value="µM";
+  g("c_media").value=f.media; g("c_part").value=f.part; g("c_rg").value=f.reagent;
+}
+function calcFmtChanged(){
+  const f = S.formats.find(x=>x.name===document.getElementById("c_fmt").value);
+  if(!f) return;
+  document.getElementById("c_media").value=f.media;
+  document.getElementById("c_part").value=f.part;
+  document.getElementById("c_rg").value=f.reagent;
+  renderCalc();
+}
+function renderCalc(){
+  const g = id=>document.getElementById(id);
+  if(!g("c_stock")) return;
+  const o = { methodId:g("c_meth").value,
+              stockUM:U.toUM(parseFloat(g("c_stock").value), g("c_su").value),
+              finalUM:U.toUM(parseFloat(g("c_final").value), g("c_fu").value),
+              media:parseFloat(g("c_media").value), part:parseFloat(g("c_part").value),
+              reagent:parseFloat(g("c_rg").value) };
+  const n = Math.max(1, parseInt(g("c_n").value)||1);
+  const mm = CALC.masterMix(o, n, S.settings);
+  g("calcOut").innerHTML = mm.ok ? mixCard(mm, o, "Single condition", null)
+    : `<div class="note e"><b>Cannot calculate.</b> ${esc(mm.reason)}</div>`;
+}
+function bindCalc(){
+  ["c_stock","c_su","c_n","c_final","c_fu","c_media","c_part","c_rg","c_meth"].forEach(id=>{
+    const e=document.getElementById(id);
+    e.addEventListener("input",renderCalc); e.addEventListener("change",renderCalc);
+  });
+  document.getElementById("c_fmt").addEventListener("change",calcFmtChanged);
+}
+
+/* Shared renderer for a prepared mix - used by both the calculator and the
+   master-mix page so the two can never drift apart. */
+function mixCard(mm, o, title, wells){
+  const d = S.settings.decimals, pw = mm.pw, m = pw.m;
+  const row = (c,per,tot,cls) =>
+    `<tr><td>${c}</td><td class="n">${per==null?"-":per.toFixed(Math.max(d,2))}</td>
+     <td class="n ${cls||""}">${tot==null?"-":tot.toFixed(d)}</td></tr>`;
+  let body = "";
+  if(m.usesDiluent){
+    body += `<tr><td colspan="3" style="padding-top:9px"><span class="tag t">Tube A &mdash; oligo</span></td></tr>`;
+    body += row("Oligo stock", pw.vOligo, mm.oligo);
+    body += row(m.diluentName, pw.diluentA, mm.diluentA);
+    body += `<tr><td><b>Tube A total</b></td><td class="n"><b>${o.part.toFixed(2)}</b></td><td class="n"><b>${mm.tubeA.toFixed(d)}</b></td></tr>`;
+    if(m.usesReagent){
+      body += `<tr><td colspan="3" style="padding-top:9px"><span class="tag t">Tube B &mdash; reagent</span></td></tr>`;
+      body += row(m.reagentName, o.reagent, mm.reagent);
+      body += row(m.diluentName, pw.diluentB, mm.diluentB);
+      body += `<tr><td><b>Tube B total</b></td><td class="n"><b>${o.part.toFixed(2)}</b></td><td class="n"><b>${mm.tubeB.toFixed(d)}</b></td></tr>`;
+    }
+  } else {
+    body += `<tr><td colspan="3" style="padding-top:9px"><span class="tag t">Direct addition &mdash; no carrier</span></td></tr>`;
+    body += row("Oligo stock", pw.vOligo, mm.oligo);
+  }
+  const warn = mm.warnings.map(w=>`<div class="note ${w.lvl==="err"?"e":w.lvl==="warn"?"w":"i"}">${esc(w.msg)}</div>`).join("");
+  const dil = mm.dilution ? (mm.dilution.impossible
+    ? `<div class="note e"><b>No workable intermediate dilution.</b> The gap between stock and
+       target is too large for a single intermediate step at a ${S.settings.minPipette} &micro;L
+       minimum. Use a lower stock or a serial dilution.</div>`
+    : `<div class="note w"><b>Intermediate dilution recommended.</b>
+       The oligo volume is ${mm.oligo.toFixed(Math.max(d,2))} &micro;L, too small to pipette reliably.
+       Prepare a <b>1:${mm.dilution.factor}</b> intermediate at <b>${U.conc(mm.dilution.newStockUM)}</b>
+       &mdash; ${mm.dilution.fromStock} &micro;L stock + ${mm.dilution.diluent} &micro;L diluent
+       = ${mm.dilution.vInt} &micro;L. Then take <b>${mm.dilution.mixVol} &micro;L</b> of that
+       intermediate instead.</div>`) : "";
+  return `<div class="panel"><div class="t data">${esc(title)}
+      <div class="r"><span class="pill">${mm.n} well${mm.n===1?"":"s"}</span>
+      <span class="pill">&times;${mm.nEff.toFixed(2)} eff.</span></div></div><div class="b">
+    <div class="grid g2" style="align-items:start">
+      <div class="scroll"><table>
+        <thead><tr><th>Component</th><th class="n">Per well</th><th class="n">Master mix</th></tr></thead>
+        <tbody>${body}</tbody>
+        <tfoot><tr><td>Total to prepare</td><td class="n">${pw.mixVol.toFixed(2)}</td>
+          <td class="n">${mm.total.toFixed(d)}</td></tr></tfoot></table></div>
+      <div>
+        <div class="kv"><span>Final culture volume</span><b>${U.vol(pw.vFinal,1)}</b></div>
+        <div class="kv"><span>Media already in well</span><b>${U.vol(o.media,1)}</b></div>
+        <div class="kv"><span>Mixture added per well</span><b>${U.vol(pw.mixVol,2)}</b></div>
+        <div class="sep"></div>
+        <div class="kv"><span>Target in well</span><b>${U.conc(o.finalUM)}</b></div>
+        <div class="kv"><span>Delivered after rounding</span><b>${U.conc(mm.deliveredUM)}</b></div>
+        <div class="kv"><span>Deviation</span><b>${(mm.concErrPct>=0?"+":"")+mm.concErrPct.toFixed(3)}%</b></div>
+        <div class="sep"></div>
+        ${m.usesDiluent?`<div class="kv"><span>Conc. in oligo tube</span><b>${U.conc(pw.vOligo*o.stockUM/o.part)}</b></div>
+        <div class="kv"><span>Conc. in combined mix</span><b>${U.conc(pw.vOligo*o.stockUM/pw.mixVol)}</b></div>`:""}
+        ${m.usesReagent?`<div class="kv"><span>${esc(m.reagentName)} v/v</span><b>${pw.pctReagent.toFixed(2)}%</b></div>`:""}
+        <div class="kv"><span>Excess applied</span><b>${S.settings.excessPct}% + ${S.settings.deadWells} well</b></div>
+      </div>
+    </div>
+    ${wells?`<div class="hint" style="margin-top:10px"><b>Wells:</b> <span class="num">${esc(wells)}</span></div>`:""}
+    ${dil}${warn}</div></div>`;
+}
+
+/* ---- master mixes derived from the layout ---- */
+function collectMixes(){
+  const groups = new Map();
+  S.plates.forEach(p=>{
+    const f = fmtOf(p);
+    Object.entries(p.wells).forEach(([id,w])=>{
+      if(!w.oligoId || w.conc==null) return;
+      const o = oligoOf(w.oligoId); if(!o) return;
+      const k = CALC.groupKey(w,p,o,f);
+      if(!groups.has(k)) groups.set(k,{ wells:[], o, p, f, w });
+      groups.get(k).wells.push(p.id+":"+id);
+    });
+  });
+  return [...groups.values()];
+}
+function renderMixes(){
+  const out = document.getElementById("mixOut"); if(!out) return;
+  const gs = collectMixes();
+  if(!gs.length){ out.innerHTML = `<div class="stub"><h3>Nothing to prepare yet</h3>
+    Assign an oligo and a concentration to some wells in the Plate Designer and the mixes appear here.</div>`; return; }
+  const d = S.settings.decimals;
+  let rows = "", totals = {}, cards = "", issues = 0;
+  gs.sort((a,b)=>b.wells.length-a.wells.length).forEach((g,i)=>{
+    const o = { methodId:g.p.methodId,
+                stockUM:U.toUM(g.o.stockConc,g.o.stockUnit),
+                finalUM:g.w.concUnit==="nM"? g.w.conc/1000 : g.w.conc,
+                media:g.f.media, part:g.f.part, reagent:g.f.reagent };
+    const mm = CALC.masterMix(o, g.wells.length, S.settings);
+    const mid = "MM-"+String(i+1).padStart(2,"0");
+    if(!mm.ok){
+      issues++;
+      rows += `<tr><td class="num">${mid}</td><td>${esc(oligoLabel(g.o))}</td>
+        <td class="n">${U.conc(o.finalUM)}</td><td class="n">${g.wells.length}</td>
+        <td colspan="5" class="hint"><span class="tag e">cannot calculate</span> ${esc(mm.reason)}</td></tr>`;
+      return;
+    }
+    if(mm.warnings.some(w=>w.lvl!=="info") || mm.dilution) issues++;
+    const m = method(g.p.methodId);
+    rows += `<tr><td class="num">${mid}</td><td>${esc(oligoLabel(g.o))}
+        <div class="hint">${esc(g.o.chemistry)} &middot; ${esc(g.p.id)} &middot; ${esc(g.f.name)} &middot; ${esc(m.name)}</div></td>
+      <td class="n">${U.conc(o.finalUM)}</td><td class="n">${g.wells.length}</td>
+      <td class="n">${mm.oligo.toFixed(d)}</td><td class="n">${m.usesDiluent?(mm.diluentA+mm.diluentB).toFixed(d):"-"}</td>
+      <td class="n">${m.usesReagent?mm.reagent.toFixed(d):"-"}</td>
+      <td class="n"><b>${mm.total.toFixed(d)}</b></td>
+      <td>${mm.dilution?'<span class="tag w">dilute</span>':''}
+          ${mm.warnings.some(w=>w.lvl==="err")?'<span class="tag e">error</span>':''}
+          ${mm.warnings.some(w=>w.lvl==="warn")?'<span class="tag w">check</span>':''}</td></tr>`;
+    const add = (k,v)=>{ totals[k]=(totals[k]||0)+v; };
+    add("Oligo stock (all)", mm.oligo);
+    if(m.usesDiluent) add(m.diluentName, mm.diluentA+mm.diluentB);
+    if(m.usesReagent) add(m.reagentName, mm.reagent);
+    cards += mixCard(mm, o, mid+"  ·  "+oligoLabel(g.o)+"  ·  "+U.conc(o.finalUM),
+                     g.wells.join(", "));
+  });
+  const tot = Object.entries(totals).map(([k,v])=>
+    `<tr><td>${esc(k)}</td><td class="n">${v.toFixed(d)} µL</td><td class="n">${(v/1000).toFixed(3)} mL</td></tr>`).join("");
+  out.innerHTML =
+    `<div class="panel"><div class="t">Preparation table
+      <div class="r"><span class="pill">${gs.length} mixes</span>
+      ${issues?`<span class="tag w">${issues} need attention</span>`:`<span class="tag k">all clear</span>`}</div></div>
+      <div class="b scroll"><table>
+        <thead><tr><th>Mix</th><th>Oligo</th><th class="n">Final</th><th class="n">Wells</th>
+          <th class="n">Oligo <span class="u">&micro;L</span></th><th class="n">Diluent <span class="u">&micro;L</span></th><th class="n">Reagent <span class="u">&micro;L</span></th>
+          <th class="n">Total <span class="u">&micro;L</span></th><th></th></tr></thead><tbody>${rows}</tbody></table></div></div>
+     <div class="panel"><div class="t">Total reagent requirement for the experiment</div>
+       <div class="b scroll"><table><thead><tr><th>Component</th><th class="n">Volume</th><th class="n"></th></tr></thead>
+       <tbody>${tot}</tbody></table>
+       <div class="hint" style="margin-top:9px">Includes ${S.settings.excessPct}% excess and
+         ${S.settings.deadWells} well of dead volume on every component.</div></div></div>`
+    + cards;
+}
+
+/* ---- vessel formats ---- */
+function renderFormats(){
+  const d = 2;
+  document.getElementById("fmtTbl").innerHTML =
+    `<thead><tr><th>Vessel</th><th class="n">Area cm&sup2;</th><th class="n">Media <span class="u">&micro;L</span></th>
+      <th class="n">Per tube <span class="u">&micro;L</span></th><th class="n">Mix (2 tubes)</th><th class="n">Final <span class="u">&micro;L</span></th>
+      <th class="n">Reagent <span class="u">&micro;L</span></th><th class="n">v/v %</th><th>Grid</th><th>Source</th></tr></thead><tbody>` +
+    S.formats.map((f,i)=>{
+      const fin = f.media + 2*f.part;
+      return `<tr><td>${esc(f.name)}</td>
+        <td class="n"><input type="number" step="any" value="${f.area}" style="width:76px"
+            oninput="setFmt(${i},'area',parseFloat(this.value))"></td>
+        <td class="n"><input type="number" step="any" value="${f.media}" style="width:84px"
+            oninput="setFmt(${i},'media',parseFloat(this.value))"></td>
+        <td class="n"><input type="number" step="any" value="${f.part}" style="width:76px"
+            oninput="setFmt(${i},'part',parseFloat(this.value))"></td>
+        <td class="n">${(2*f.part).toFixed(d)}</td>
+        <td class="n"><b>${fin.toFixed(1)}</b></td>
+        <td class="n"><input type="number" step="any" value="${f.reagent}" style="width:76px"
+            oninput="setFmt(${i},'reagent',parseFloat(this.value))"></td>
+        <td class="n">${(f.reagent/fin*100).toFixed(2)}</td>
+        <td class="hint">${f.plate? f.rows+" × "+f.cols : "vessels"}</td>
+        <td>${f.measured?'<span class="tag k">measured</span>':'<span class="tag w">derived</span>'}</td></tr>`;
+    }).join("") + "</tbody>";
+}
+function setFmt(i,k,v){ S.formats[i][k]=v; S.formats[i].measured=false;
+  save(); renderFormats(); renderPlateProps(); renderMixes(); renderCalc(); }
+
+/* ---- summary bar ---- */
+function renderStats(){
+  const plates = S.plates.length;
+  let wells=0, assigned=0, unassigned=0;
+  const conds = new Set(), used = new Set();
+  S.plates.forEach(p=>{
+    const ids = wellIds(p); wells += ids.length;
+    ids.forEach(id=>{ const w=getW(p,id);
+      if(isEmptyW(w)) { unassigned++; return; }
+      assigned++;
+      if(w.oligoId){ used.add(w.oligoId);
+        conds.add(w.oligoId+"|"+(w.concUnit==="nM"?w.conc/1000:w.conc)+"|"+p.methodId); }
+    });
+  });
+  const gs = collectMixes();
+  let warn=0, err=0;
+  gs.forEach(g=>{
+    const o = { methodId:g.p.methodId, stockUM:U.toUM(g.o.stockConc,g.o.stockUnit),
+                finalUM:g.w.concUnit==="nM"? g.w.conc/1000 : g.w.conc,
+                media:g.f.media, part:g.f.part, reagent:g.f.reagent };
+    const mm = CALC.masterMix(o, g.wells.length, S.settings);
+    if(!mm.ok){ err++; return; }
+    if(mm.warnings.some(w=>w.lvl==="err")) err++;
+    else if(mm.warnings.some(w=>w.lvl==="warn") || mm.dilution) warn++;
+  });
+  const dup = duplicateIds();
+  document.getElementById("stats").innerHTML =
+    [["Plates",plates,""],["Conditions",conds.size,""],["Wells used",assigned+" / "+wells,""],
+     ["Oligos",used.size+" / "+S.oligos.length,""],["Mixes",gs.length,""],
+     ["Unassigned",unassigned,unassigned?"warn":""],
+     ["Warnings",warn,warn?"warn":""],["Errors",err+dup.length,(err+dup.length)?"err":""]]
+    .map(s=>`<div class="s ${s[2]}"><b>${s[1]}</b><span>${s[0]}</span></div>`).join("");
+}
+/* Duplicate well addresses cannot happen by construction, but duplicate plate
+   IDs can - and they would collide in any export. Checked here rather than
+   discovered later in Excel. */
+function duplicateIds(){
+  const seen = {}, dups = [];
+  S.plates.forEach(p=>{ const k=(p.id||"").trim().toLowerCase();
+    if(seen[k]) dups.push(p.id); seen[k]=1; });
+  return dups;
+}
+
+/* ---- JSON ---- */
+function exportJSON(){
+  const blob = new Blob([JSON.stringify({ format:"txplanner/1", saved:new Date().toISOString(), data:S },null,2)],
+                        {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (S.meta.id||"experiment").replace(/[^\w.-]+/g,"_")+".json";
+  a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
+function importJSON(input){
+  const f = input.files[0]; if(!f) return;
+  const r = new FileReader();
+  r.onload = () => {
+    try{
+      const o = JSON.parse(r.result);
+      const d = o && o.data ? o.data : o;
+      if(!d || !d.plates) throw new Error("not a planner file");
+      S = d; S.settings = Object.assign(defaults(), S.settings||{});
+      S.active = 0; sel.clear(); save(); renderAll();
+    }catch(e){ alert("Could not read that file: "+e.message); }
+    input.value = "";
+  };
+  r.readAsText(f);
+}
+
+/* ========================================================================
+   TESTS  -  assertions against CALC, including parity with the workbook
+   ======================================================================== */
+function runTests(){
+  const T = [];
+  const ok = (name, cond, detail) => T.push({name, pass:!!cond, detail:detail||""});
+  const near = (a,b,tol) => Math.abs(a-b) <= (tol==null?1e-9:tol);
+  const S1 = { excessPct:0, deadWells:0, minPipette:0.4, decimals:1 };
+  const f96 = BASE_FORMATS.find(f=>f.name==="96-well");
+  const base = { methodId:"rnaimax", stockUM:400, finalUM:2.5,
+                 media:90, part:5, reagent:0.3 };
+
+  // 1-4  parity with the source workbook (ASOs!I20, K20, M20, E9)
+  const w = CALC.masterMix(base, 35, S1);
+  ok("Workbook ASOs!I20 - oligo master mix = 21.9 µL", near(w.oligo,21.9,1e-9), w.oligo+" µL");
+  ok("Workbook ASOs!K20 - Opti-MEM = 153.1 µL", near(w.diluentA,153.1,1e-9), w.diluentA+" µL");
+  ok("Workbook ASOs!M20 - RNAiMix = 175.0 µL", near(w.tubeB,175,1e-9), w.tubeB+" µL");
+  ok("Workbook ASOs!E9 - final culture volume = 100 µL", near(w.pw.vFinal,100), w.pw.vFinal+" µL");
+
+  // 5-7  the concentration cascade the brief insists must not be confused
+  ok("Oligo per well = 0.625 µL", near(w.pw.vOligo,0.625), w.pw.vOligo+" µL");
+  ok("Concentration in tube A = 50 µM", near(w.pw.vOligo*400/5,50));
+  ok("Concentration in combined mix = 25 µM", near(w.pw.vOligo*400/10,25));
+  ok("Concentration in the well = 2.5 µM", near(w.pw.vOligo*400/100,2.5));
+
+  // 8  rounding is disclosed, not hidden
+  ok("Rounding deviation reported and under 0.2%", Math.abs(w.concErrPct)<0.2,
+     w.concErrPct.toFixed(4)+"%");
+
+  // 9  tube totals stay exact despite rounding (back-calculated diluent)
+  let exact = true;
+  for(let n=1;n<=200;n++){
+    const m = CALC.masterMix(base, n, {excessPct:10,deadWells:1,minPipette:0.4,decimals:1});
+    if(!near(m.oligo+m.diluentA, m.tubeA, 1e-9)) { exact=false; break; }
+  }
+  ok("Tube A total stays exact for n = 1..200", exact);
+
+  // 10  one excess rule
+  ok("Excess 10% + 1 well on 32 wells = 36.2 effective",
+     near(CALC.effWells(32,10,1),36.2,1e-9), CALC.effWells(32,10,1).toFixed(2));
+
+  // 11  unit conversion round-trips
+  ok("Units: 0.4 mM = 400 µM = 400000 nM",
+     U.toUM(0.4,"mM")===400 && near(U.fromUM(400,"nM"),400000));
+  const cNM = CALC.masterMix(Object.assign({},base,{finalUM:U.toUM(100,"nM")}),32,S1);
+  ok("A 100 nM target gives 0.025 µL per well", near(cNM.pw.vOligo,0.025,1e-12),
+     cNM.pw.vOligo+" µL");
+
+  // 12  gymnotic is solved exactly, not approximated
+  const gy = CALC.masterMix(Object.assign({},base,{methodId:"gymnotic"}), 10, S1);
+  const back = gy.pw.vOligo*400/gy.pw.vFinal;
+  ok("Gymnotic: delivered concentration solves back to exactly 2.5 µM",
+     near(back,2.5,1e-9), back.toFixed(9)+" µM");
+  ok("Gymnotic uses no reagent and no diluent", gy.reagent===0 && gy.diluentA===0);
+
+  // 13  the 0.4 µL floor and the thresholds quoted in the UI
+  ok("Single well falls below 0.4 µL under 1.6 µM",
+     CALC.perWell(Object.assign({},base,{finalUM:1.59})).vOligo < 0.4 &&
+     CALC.perWell(Object.assign({},base,{finalUM:1.61})).vOligo > 0.4);
+  const at46 = CALC.masterMix(Object.assign({},base,{finalUM:0.0457}),35,S1);
+  ok("A 35-well mix holds above 0.4 µL down to about 46 nM",
+     at46.oligo >= 0.4, at46.oligo.toFixed(3)+" µL");
+
+  // 14  intermediate dilution actually fixes the problem it reports
+  const tiny = CALC.masterMix(Object.assign({},base,{finalUM:0.001}), 8, S1);
+  const dd = tiny.dilution;
+  ok("A sub-pipettable condition proposes an intermediate dilution", !!dd);
+  if(dd && !dd.impossible){
+    ok("The proposed intermediate is itself pipettable",
+       dd.fromStock >= S1.minPipette && dd.mixVol >= S1.minPipette,
+       "take "+dd.fromStock+" µL stock; use "+dd.mixVol+" µL of intermediate");
+    ok("The intermediate stock still exceeds the target concentration",
+       dd.newStockUM > 0.001);
+  }
+
+  // 15  impossible and missing inputs are refused, never silently computed
+  ok("Target at or above stock is refused",
+     CALC.perWell(Object.assign({},base,{finalUM:400})).ok===false);
+  ok("Missing stock concentration is refused",
+     CALC.perWell(Object.assign({},base,{stockUM:0})).ok===false);
+  ok("Zero target concentration is refused",
+     CALC.perWell(Object.assign({},base,{finalUM:0})).ok===false);
+  ok("An oligo volume larger than its tube is refused",
+     CALC.perWell({methodId:"rnaimax",stockUM:5,finalUM:4,media:90,part:5,reagent:0.3}).ok===false);
+
+  // 16  a volume is never silently rounded to zero
+  const z = CALC.masterMix(Object.assign({},base,{finalUM:0.0001}), 2, {excessPct:0,deadWells:0,minPipette:0.4,decimals:1});
+  ok("A volume rounding to zero raises an error rather than passing",
+     z.oligo===0 ? z.warnings.some(x=>x.lvl==="err") : true,
+     "oligo rounds to "+z.oligo);
+
+  // 17  every format produces a coherent, positive geometry
+  let allFmt = true, bad = "";
+  BASE_FORMATS.forEach(f=>{
+    const m = CALC.masterMix({methodId:"rnaimax",stockUM:400,finalUM:2.5,
+                              media:f.media,part:f.part,reagent:f.reagent}, 4, S1);
+    if(!m.ok || !(m.pw.vFinal>0) || !near(m.pw.vFinal, f.media+2*f.part, 1e-9) ||
+       m.oligo<0 || m.diluentA<0){ allFmt=false; bad=f.name; }
+  });
+  ok("All "+BASE_FORMATS.length+" vessel formats calculate coherently", allFmt, bad?("failed: "+bad):"");
+  ok("96-well reagent is 0.30% v/v as measured",
+     near(f96.reagent/(f96.media+2*f96.part)*100, 0.3, 1e-9));
+
+  // 18  master-mix grouping separates what must stay separate
+  const fA = Object.assign({},f96);
+  const oA = {id:"a",chemistry:"steric",stockConc:400,stockUnit:"µM"};
+  const oB = {id:"a",chemistry:"gapmer",stockConc:400,stockUnit:"µM"};
+  const pA = {methodId:"rnaimax"};
+  const k1 = CALC.groupKey({oligoId:"a",conc:2.5,concUnit:"µM"},pA,oA,fA);
+  const k2 = CALC.groupKey({oligoId:"a",conc:2.5,concUnit:"µM"},pA,oB,fA);
+  const k3 = CALC.groupKey({oligoId:"a",conc:2500,concUnit:"nM"},pA,oA,fA);
+  const k4 = CALC.groupKey({oligoId:"a",conc:2.5,concUnit:"µM"},{methodId:"gymnotic"},oA,fA);
+  ok("Different chemistry is never pooled into one mix", k1!==k2);
+  ok("Different method is never pooled into one mix", k1!==k4);
+  ok("2500 nM and 2.5 µM are recognised as the same condition", k1===k3);
+
+  // 19  JSON round-trip preserves the experiment
+  const snap = JSON.stringify(S);
+  let rt = false;
+  try{ const c = JSON.parse(snap); rt = JSON.stringify(c)===snap && !!c.plates; }catch(e){}
+  ok("Experiment survives a JSON round-trip", rt);
+
+  // 20  plate IDs are unique
+  ok("No duplicate plate identifiers", duplicateIds().length===0,
+     duplicateIds().join(", "));
+
+  return T;
+}
+function renderTests(){
+  const el = document.getElementById("testOut"); if(!el) return;
+  const T = runTests(), pass = T.filter(t=>t.pass).length;
+  const head = `<div class="note ${pass===T.length?"k":"e"}">
+    <b>${pass} of ${T.length} checks pass.</b> ${pass===T.length
+      ? "The calculation core reproduces the workbook's own cell values and holds every invariant below."
+      : "Some checks failed - the failing rows are marked below."}</div>`;
+  el.innerHTML = head + `<div class="scroll"><table><thead><tr><th style="width:52px">Result</th>
+    <th>Check</th><th>Value</th></tr></thead><tbody>` +
+    T.map(t=>`<tr><td>${t.pass?'<span class="tag k">pass</span>':'<span class="tag e">fail</span>'}</td>
+      <td>${esc(t.name)}</td><td class="num hint">${esc(t.detail)}</td></tr>`).join("") +
+    `</tbody></table></div>`;
+}
+
+/* ========================================================================
+   BOOT
+   ======================================================================== */
+document.querySelectorAll("#nav a").forEach(a=>{
+  a.addEventListener("click",()=>{
+    document.querySelectorAll("#nav a").forEach(x=>x.classList.remove("on"));
+    document.querySelectorAll("section").forEach(x=>x.classList.remove("on"));
+    a.classList.add("on");
+    document.getElementById("s-"+a.dataset.s).classList.add("on");
+    window.scrollTo(0,0);
+  });
+});
+loadLibraryFromStore();
+if(!load()) loadExample();
+bindMeta(); bindPlateProps(); bindCalc();
+renderAll(); renderAssignOptions(); wireLibDrop(); autoLoadLibrary();
+</script>
+</body>
+</html>
