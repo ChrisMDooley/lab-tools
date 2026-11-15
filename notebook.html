@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab notebook</title>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  .nb{display:grid;grid-template-columns:300px 1fr;gap:18px;align-items:start}
+  @media(max-width:900px){.nb{grid-template-columns:1fr}}
+  .entries{max-height:72vh;overflow:auto;border:1px solid var(--line,#d8d6d0);border-radius:6px}
+  .entry{padding:10px 12px;border-bottom:1px solid var(--faint,#edebe7);cursor:pointer}
+  .entry:last-child{border-bottom:0}
+  .entry:hover{background:var(--faint,#edebe7)}
+  .entry.sel{background:#e8f1f4;box-shadow:inset 3px 0 0 #3B9AB2}
+  .entry b{display:block;font-size:13px;margin-bottom:2px}
+  .entry .m{font-size:10.5px;color:var(--mute,#78766f)}
+  .entry .p{font-size:11px;color:var(--mute,#78766f);margin-top:3px;
+            display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  /* µ must never be uppercased: text-transform turns U+00B5 into Greek Mu,
+     so "µL" would read "ML" - a 1000x misreading in a lab record. */
+  .u,.rendered{text-transform:none}
+  #editor{width:100%;min-height:340px;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;
+          padding:11px;border:1px solid var(--line,#d8d6d0);border-radius:6px;resize:vertical}
+  .rendered{line-height:1.6;font-size:13.5px}
+  .rendered img{max-width:100%;height:auto;border:1px solid var(--line,#d8d6d0);
+                border-radius:4px;margin:8px 0;display:block}
+  .rendered table{border-collapse:collapse;margin:10px 0;font-size:12.5px}
+  .rendered th,.rendered td{border:1px solid var(--line,#d8d6d0);padding:5px 9px;text-align:left}
+  .rendered th{background:var(--faint,#edebe7)}
+  .rendered pre{background:#f6f5f2;padding:9px 11px;border-radius:5px;overflow:auto;font-size:12px}
+  .rendered blockquote{border-left:3px solid #78B7C5;margin:8px 0;padding:2px 0 2px 12px;color:#4a4845}
+  .rendered h3{font-size:16px;margin:14px 0 6px} .rendered h4{font-size:14px;margin:12px 0 5px}
+  .rendered ul,.rendered ol{padding-left:22px;margin:8px 0}
+  .rendered li{margin:3px 0}
+  /* A task item reads as one line: checkbox, then its text. Plain inline
+     flow, deliberately - a flex row here put the box and the words on
+     separate lines in testing. */
+  .rendered li.task{list-style:none;margin-left:-22px}
+  /* app.css sets input{width:100%} for form fields, which stretches a
+     checkbox across the whole line and pushes its label onto the next one.
+     Undo it for checkboxes inside rendered content only. */
+  .rendered li.task input[type=checkbox]{width:auto;display:inline-block;
+     margin:0 7px 0 0;vertical-align:middle;padding:0}
+  .tag{display:inline-block;background:var(--faint,#edebe7);border-radius:10px;
+       padding:1px 9px;font-size:10.5px;margin-right:4px}
+  .drop{outline:2px dashed #3B9AB2;outline-offset:-4px}
+</style>
+</head>
+<body>
+<div id="top">
+  <h1>Lab notebook</h1>
+  <nav>
+    <a href="index.html">Transfection</a>
+    <a href="qpcr.html">qPCR analysis</a>
+    <a href="notebook.html" class="on">Notebook</a>
+  </nav>
+</div>
+
+<main>
+  <div id="wsPanel"></div>
+
+  <section class="panel"><div class="t">Experiment</div><div class="b">
+    <div class="grid g2">
+      <label><i>Folder</i><select id="expSel"></select></label>
+      <label><i>Your name</i><input id="who" placeholder="who is writing"></label>
+    </div>
+    <div class="btns" style="margin-top:10px">
+      <button class="p" onclick="newEntry()" id="newBtn">New entry</button>
+      <input id="q" placeholder="search every experiment" style="flex:1">
+      <button onclick="doSearch()">Search</button>
+    </div>
+    <div id="searchOut"></div>
+  </div></section>
+
+  <section class="panel"><div class="t">Entries</div><div class="b">
+    <div class="nb">
+      <div class="entries" id="list"></div>
+      <div id="pane"></div>
+    </div>
+  </div></section>
+
+  <section class="panel"><div class="t">How this is stored</div><div class="b">
+    <div class="note i">Each entry is a Markdown file in
+      <code>experiments/&lt;ID&gt;/notebook/</code>, with pasted images written beside it in
+      <code>notebook/attachments/</code> and named after a hash of their own bytes. Open the
+      folder in ten years with no browser and the record is still readable.
+      Editing or deleting an entry keeps the superseded text under
+      <code>notebook/.history/</code> &mdash; not an audit trail, just a safety net, so a wrong
+      edit is recoverable. Everything is checksummed in the experiment's manifest.</div>
+    <div class="note w" style="margin-top:9px"><b>This is not a compliant ELN.</b>
+      It has no counter-signing and no tamper-evidence against you, because you asked for a
+      working bench record rather than Benchling's ceremony. Anything that needs a signed,
+      audited record still belongs in Labfolder &mdash; export the experiment and attach it there.</div>
+  </div></section>
+
+  <section class="panel"><div class="t">Self-test</div><div class="b">
+    <div id="testOut"></div></div></section>
+</main>
+
+<script src="js/vfs.js"></script>
+<script src="js/bundle.js"></script>
+<script src="js/workspace.js"></script>
+<script src="js/md.js"></script>
+<script src="js/notebook.js"></script>
+<script>
+"use strict";
+let EXP = null, ENTRIES = [], CUR = null, EDITING = false, BLOBS = [];
+const g = id => document.getElementById(id);
+const esc = s => String(s==null?"":s).replace(/[&<>"']/g,c=>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function revoke(){ BLOBS.forEach(u=>{ try{ URL.revokeObjectURL(u); }catch(e){} }); BLOBS=[]; }
+
+/* ---- workspace ---------------------------------------------------------- */
+async function boot(){
+  g("who").value = WS.owner();
+  g("who").addEventListener("input", e=>WS.setOwner(e.target.value));
+  WS.onChange(drawWs);
+  const st = await WS.restore();
+  drawWs(st); await refresh();
+  runTests();
+}
+function drawWs(st){ g("wsPanel").innerHTML = WS.panelHTML(st && st.state ? st : null); }
+WS._connect   = async()=>{ try{ await WS.connect(); await refresh(); }catch(e){ alert(e.message); } };
+WS._grant     = async()=>{ await WS.grant(); await refresh(); };
+WS._disconnect= async()=>{ await WS.disconnect(); await refresh(); };
+WS._refresh   = refresh;
+
+async function refresh(){
+  drawWs();
+  const sel = g("expSel");
+  if(!WS.connected()){
+    sel.innerHTML = '<option>- no data folder -</option>';
+    g("list").innerHTML = '<div style="padding:14px;font-size:12px;color:#78766f">'
+      + 'Connect a data folder to read and write notebook entries.</div>';
+    g("pane").innerHTML = ""; g("newBtn").disabled = true; return;
+  }
+  g("newBtn").disabled = false;
+  const exps = await WS.listExperiments();
+  if(!exps.length){
+    sel.innerHTML = '<option>- no experiments yet -</option>';
+    g("list").innerHTML = '<div style="padding:14px;font-size:12px;color:#78766f">'
+      + 'No experiments in this folder yet. Save one from the planner first.</div>';
+    g("pane").innerHTML = ""; g("newBtn").disabled = true; return;
+  }
+  sel.innerHTML = exps.map(e=>`<option value="${esc(e.id)}" ${e.id===EXP?"selected":""}>`
+    + `${esc(e.name)}${e.runs?" · "+e.runs+" qPCR run"+(e.runs>1?"s":""):""}</option>`).join("");
+  EXP = EXP && exps.some(e=>e.id===EXP) ? EXP : exps[0].id;
+  sel.value = EXP;
+  await loadEntries();
+}
+g("expSel").addEventListener("change", async e=>{ EXP = e.target.value; CUR=null; await loadEntries(); });
+
+async function loadEntries(){
+  ENTRIES = await NOTEBOOK.list(WS.current(), EXP);
+  g("list").innerHTML = ENTRIES.length ? ENTRIES.map((e,i)=>
+    `<div class="entry ${CUR&&CUR.file===e.file?"sel":""}" onclick="open_(${i})">
+       <b>${esc(e.title||e.file)}</b>
+       <div class="m">${esc((e.created||"").replace("T"," "))}${e.author?" · "+esc(e.author):""}${
+         e.edited?" · edited":""}</div>
+       ${(e.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}
+       <div class="p">${esc(e.preview||"")}</div></div>`).join("")
+    : '<div style="padding:14px;font-size:12px;color:#78766f">No entries yet.</div>';
+  if(CUR){ const still = ENTRIES.find(e=>e.file===CUR.file);
+           if(still) { CUR = still; await view(); } else { CUR=null; g("pane").innerHTML=""; } }
+}
+async function open_(i){ CUR = ENTRIES[i]; EDITING = false; await loadEntries(); await view(); }
+
+/* ---- viewing ------------------------------------------------------------ */
+async function view(){
+  if(!CUR) return;
+  revoke();
+  const r = await NOTEBOOK.resolveImages(WS.current(), EXP, MD.render(CUR.body||""));
+  BLOBS = r.urls;
+  const hist = await NOTEBOOK.history(WS.current(), EXP, CUR.file);
+  g("pane").innerHTML =
+    `<div class="btns" style="margin-bottom:10px">
+       <button class="p" onclick="edit()">Edit</button>
+       <button onclick="del()">Delete</button>
+       <span style="flex:1"></span>
+       <span style="font-size:10.5px;color:#78766f">${esc(CUR.file)}${
+         hist.length?" · "+hist.length+" earlier version"+(hist.length>1?"s":""):""}</span>
+     </div>
+     <h2 style="margin:0 0 4px;font-size:18px">${esc(CUR.title||CUR.file)}</h2>
+     <div style="font-size:11px;color:#78766f;margin-bottom:12px">
+       ${esc((CUR.created||"").replace("T"," "))}${CUR.author?" · "+esc(CUR.author):""}${
+       CUR.edited?" · edited "+esc(CUR.edited.replace("T"," ")):""}</div>
+     <div class="rendered">${r.html}</div>`;
+}
+
+/* ---- editing ------------------------------------------------------------ */
+function newEntry(){
+  CUR = { file:null, title:"", author:WS.owner()||"", tags:[], body:"", created:"", edited:"" };
+  EDITING = true; form();
+}
+function edit(){ EDITING = true; form(); }
+function form(){
+  g("pane").innerHTML =
+    `<div class="grid g2">
+       <label><i>Title</i><input id="f_title" value="${esc(CUR.title||"")}"></label>
+       <label><i>Tags, comma separated</i><input id="f_tags" value="${esc((CUR.tags||[]).join(", "))}"></label>
+     </div>
+     <label style="display:block;margin-top:10px"><i>Entry &mdash; Markdown. Paste an image or
+       paste cells straight from Excel.</i>
+       <textarea id="editor" class="u" placeholder="What happened at the bench.">${esc(CUR.body||"")}</textarea>
+     </label>
+     <div class="btns" style="margin-top:10px">
+       <button class="p" onclick="saveEntry()">Save</button>
+       <button onclick="cancel()">Cancel</button>
+       <span style="flex:1"></span>
+       <span id="pasteMsg" style="font-size:10.5px;color:#78766f"></span>
+     </div>
+     <div class="note i" style="margin-top:11px">Live preview</div>
+     <div class="rendered" id="prev" style="margin-top:8px"></div>`;
+  const ed = g("editor");
+  ed.addEventListener("input", preview);
+  ed.addEventListener("paste", onPaste);
+  ed.addEventListener("dragover", e=>{ e.preventDefault(); ed.classList.add("drop"); });
+  ed.addEventListener("dragleave", ()=>ed.classList.remove("drop"));
+  ed.addEventListener("drop", onDrop);
+  preview();
+}
+let prevT = null;
+function preview(){
+  clearTimeout(prevT);
+  prevT = setTimeout(async()=>{
+    /* The editor can be gone by the time this fires: saving or cancelling
+       replaces the pane within the debounce window. */
+    const ed = g("editor"); if(!ed) return;
+    revoke();
+    const r = await NOTEBOOK.resolveImages(WS.current(), EXP, MD.render(ed.value));
+    BLOBS = r.urls;
+    const p = g("prev");
+    if(p) p.innerHTML = r.html; else revoke();
+  }, 180);
+}
+function insert(text){
+  const ed = g("editor"), s = ed.selectionStart, e = ed.selectionEnd;
+  ed.value = ed.value.slice(0,s) + text + ed.value.slice(e);
+  ed.selectionStart = ed.selectionEnd = s + text.length;
+  ed.focus(); preview();
+}
+async function onPaste(ev){
+  const items = [...(ev.clipboardData ? ev.clipboardData.items : [])];
+  const img = items.find(i=>i.type && i.type.indexOf("image/")===0);
+  if(img){
+    ev.preventDefault();
+    const file = img.getAsFile();
+    await addImage(file);
+    return;
+  }
+  const txt = ev.clipboardData && ev.clipboardData.getData("text/plain");
+  if(txt && txt.indexOf("\t") >= 0){
+    const tbl = MD.tsvToTable(txt);
+    if(tbl){ ev.preventDefault(); insert("\n" + tbl + "\n");
+             msg("Pasted as a table."); }
+  }
+}
+async function onDrop(ev){
+  ev.preventDefault(); g("editor").classList.remove("drop");
+  const files = [...(ev.dataTransfer ? ev.dataTransfer.files : [])].filter(f=>/^image\//.test(f.type));
+  for(const f of files) await addImage(f);
+}
+async function addImage(file){
+  if(!file) return;
+  if(!WS.connected()){ msg("Connect a data folder before adding images."); return; }
+  const ext = (file.type.split("/")[1]||"png").replace("jpeg","jpg").replace("svg+xml","svg");
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const a = await NOTEBOOK.attach(WS.current(), EXP, bytes, ext);
+  insert(`\n![${file.name||"image"}](${a.path})\n`);
+  msg(a.reused ? "Image already in this experiment - reused, not duplicated."
+               : "Image saved (" + Math.round(a.bytes/1024) + " kB).");
+}
+function msg(t){ const m=g("pasteMsg"); if(m){ m.textContent=t; setTimeout(()=>{ if(m) m.textContent=""; },4000); } }
+
+async function saveEntry(){
+  const title = g("f_title").value.trim();
+  const tags = g("f_tags").value.split(",").map(t=>t.trim()).filter(Boolean);
+  const body = g("editor").value;
+  if(!title && !body.trim()){ alert("An empty entry is not worth saving."); return; }
+  const who = g("who").value.trim() || WS.owner();
+  if(who) WS.setOwner(who);
+  try{
+    if(CUR.file) CUR = await NOTEBOOK.update(WS.current(), EXP, CUR.file, {title, tags, body, author:CUR.author||who});
+    else         CUR = await NOTEBOOK.create(WS.current(), EXP, {title, tags, body, author:who});
+    EDITING = false;
+    await loadEntries(); await view();
+  }catch(e){ alert("Could not save: " + e.message); }
+}
+function cancel(){ EDITING=false; if(CUR && CUR.file) view(); else { CUR=null; g("pane").innerHTML=""; } }
+async function del(){
+  if(!CUR || !CUR.file) return;
+  if(!confirm('Delete "' + (CUR.title||CUR.file) + '"?\n\nThe text is kept under notebook/.history/, '
+    + 'so this is recoverable from the folder.')) return;
+  await NOTEBOOK.remove(WS.current(), EXP, CUR.file);
+  CUR = null; g("pane").innerHTML = ""; await loadEntries();
+}
+
+/* ---- search ------------------------------------------------------------- */
+async function doSearch(){
+  const q = g("q").value.trim();
+  if(!q){ g("searchOut").innerHTML=""; return; }
+  if(!WS.connected()){ g("searchOut").innerHTML='<div class="note w">No data folder connected.</div>'; return; }
+  const hits = await NOTEBOOK.search(WS.current(), q);
+  g("searchOut").innerHTML = !hits.length
+    ? `<div class="note i" style="margin-top:10px">Nothing matches &ldquo;${esc(q)}&rdquo;.</div>`
+    : `<div class="note k" style="margin-top:10px"><b>${hits.length} entr`
+      + (hits.length>1?"ies":"y") + `</b></div>`
+      + hits.map(h=>`<div class="entry" onclick="jumpTo('${esc(h.experiment)}','${esc(h.file)}')">
+          <b>${esc(h.title||h.file)}</b>
+          <div class="m">${esc(h.experimentName||h.experiment)} · ${esc((h.created||"").replace("T"," "))}</div>
+          <div class="p">…${esc(h.context)}…</div></div>`).join("");
+}
+async function jumpTo(exp, file){
+  EXP = exp; g("expSel").value = exp; CUR = null;
+  await loadEntries();
+  const i = ENTRIES.findIndex(e=>e.file===file);
+  if(i>=0) await open_(i);
+}
+
+/* ---- self-test ---------------------------------------------------------- */
+async function runTests(){
+  const out = [];
+  const t = (name, fn) => { try{ const r = fn(); out.push({name, pass:r===true, detail:r===true?"":String(r)}); }
+                            catch(e){ out.push({name, pass:false, detail:e.message}); } };
+  /* The closing tag below is written "<\/script>" on purpose: an unescaped
+     one inside a string still ends the HTML script block, which silently
+     truncates everything after it. */
+  t("Pasted script tag is inert", ()=> !/<script/i.test(MD.render("<script>x<\/script>")) || "rendered a script tag");
+  t("javascript: link is not clickable", ()=> !/<a /.test(MD.render("[a](javascript:x)")) || "made a link");
+  t("Attachment image renders", ()=> /<img src="attachments\/a\.png"/.test(MD.render("![](attachments/a.png)")) || "no img");
+  t("Path traversal rejected", ()=> !/<img/.test(MD.render("![](attachments/../x.png)")) || "allowed traversal");
+  t("Excel paste becomes a table", ()=>{
+    const m = MD.tsvToTable("A\tB\n1\t2"); return (m && /\| --- \| --- \|/.test(m)) || "no table"; });
+  t("Prose with a tab is not a table", ()=> MD.tsvToTable("hello\tworld")===null || "false positive");
+  t("Frontmatter round-trips", ()=>{
+    const e = {title:"T", author:"CD", created:"2026-11-15T15:40:00", tags:["a","b"], body:"# x\n\nbody"};
+    const p = NOTEBOOK.parse(NOTEBOOK.compose(e), "notebook/x.md");
+    return (p.title==="T" && p.author==="CD" && p.tags.join()==="a,b" && p.body.trim()==="# x\n\nbody") ||
+           JSON.stringify(p); });
+  t("A body containing --- survives", ()=>{
+    const p = NOTEBOOK.parse(NOTEBOOK.compose({title:"T",body:"one\n\n---\n\ntwo"}), "notebook/x.md");
+    return p.body.includes("---") && p.body.includes("two") || "lost the rule"; });
+  t("Entry stamps carry seconds", ()=> /\d{6}$/.test(NOTEBOOK._stamp(new Date())) || "minute resolution only");
+  t("Title slug is filesystem-safe", ()=> /^[\w-]+$/.test(NOTEBOOK._slug("µL / 50% «x»")) || NOTEBOOK._slug("µL / 50% «x»"));
+  t("µ is not uppercased in the editor", ()=>{
+    const el = document.querySelector(".u");
+    if(!el) return true;                       // the editor is not open
+    return getComputedStyle(el).textTransform === "none" || "text-transform is not none"; });
+
+  const pass = out.filter(x=>x.pass).length;
+  g("testOut").innerHTML =
+    `<div class="note ${pass===out.length?"k":"w"}"><b>${pass} of ${out.length} checks pass.</b></div>`
+    + `<table style="margin-top:9px;font-size:12px;border-collapse:collapse">`
+    + out.map(x=>`<tr><td style="padding:3px 10px 3px 0;color:${x.pass?"#2a7":"#c33"}">`
+      + `${x.pass?"pass":"FAIL"}</td><td style="padding:3px 10px 3px 0">${esc(x.name)}</td>`
+      + `<td style="color:#78766f">${esc(x.detail)}</td></tr>`).join("") + `</table>`;
+  return out;
+}
+boot();
+</script>
+</body>
+</html>

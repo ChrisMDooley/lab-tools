@@ -1,4 +1,4 @@
-# DMD Lab Platform
+# Lab tools
 
 Browser tools for this lab's transfection and qPCR work. No install, no server, no network.
 
