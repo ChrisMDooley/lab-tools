@@ -927,26 +927,34 @@ function renderOligos(){
    Kept in its own localStorage key so it survives switching experiments.
    ======================================================================== */
 const LIBKEY = "txplanner.library.v1";
-let LIB = [];
+let LIB = [], LIB_SOURCE = "none";
 function loadLibraryFromStore(){
   try{ const r=localStorage.getItem(LIBKEY); LIB = r? JSON.parse(r) : []; }catch(e){ LIB=[]; }
+  LIB_SOURCE = LIB.length ? "browser" : "none";
 }
 function saveLibrary(){ try{ localStorage.setItem(LIBKEY, JSON.stringify(LIB)); }catch(e){} }
-function setLibrary(arr){
+/* Normalising means the in-memory library never byte-matches the raw file, so a
+   "has the folder changed?" check must compare normalised against normalised.
+   Hence this is separate from setLibrary rather than inlined in it. */
+function normaliseLib(arr){
   if(!Array.isArray(arr)) throw new Error("expected a JSON array of oligos");
-  LIB = arr.filter(o=>o && o.name).map(o=>({
+  return arr.filter(o=>o && o.name).map(o=>({
     name:String(o.name), label:o.label?String(o.label):"",
+    gene:o.gene?String(o.gene):"",
     chemistry:o.chemistry||"steric",
     stockConc:parseFloat(o.stockConc)||400, stockUnit:o.stockUnit||"µM",
     seq:o.seq?String(o.seq).toUpperCase().replace(/\s+/g,""):"",
     notes:o.notes?String(o.notes):"" }));
+}
+function setLibrary(arr){
+  LIB = normaliseLib(arr);
   saveLibrary(); renderLibrary(); renderOligos();
 }
 function importLibrary(input){
   const f=input.files[0]; if(!f) return;
   const r=new FileReader();
   r.onload=()=>{ try{ const d=JSON.parse(r.result);
-      setLibrary(Array.isArray(d)? d : d.oligos);
+      setLibrary(Array.isArray(d)? d : d.oligos); LIB_SOURCE="file"; renderLibrary();
     }catch(e){ alert("Could not read that library: "+e.message); }
     input.value=""; };
   r.readAsText(f);
@@ -979,8 +987,14 @@ function renderLibrary(){
     ls.innerHTML=""; dz.style.display="block"; return;
   }
   dz.style.display="none";
-  st.innerHTML = `<div class="note k"><b>${LIB.length} oligos loaded</b> from your local library,
-    held in this browser only. Nothing here is written into the application file.</div>`;
+  const src = { folder:"from the connected <b>data folder</b> &mdash; the shared copy, and the one that wins",
+                browser:"from <b>this browser's</b> stored copy. Connect a data folder to share it",
+                file:"from a <b>file you loaded</b>, now cached in this browser",
+                none:"" }[LIB_SOURCE] || "";
+  st.innerHTML = `<div class="note k"><b>${LIB.length} oligos loaded</b> ${src}.
+    Sequences stay on your machine &mdash; nothing here is written into the application file
+    or sent anywhere.
+    ${LIB_SOURCE==="folder"?'<div class="btns" style="margin-top:8px"><button onclick="wsReloadLibrary()">Re-read from folder</button></div>':""}</div>`;
   ls.innerHTML = `<table><thead><tr><th>Name</th><th>Label</th><th>Sequence</th><th class="n">nt</th>
     <th>Chemistry</th><th class="n">Stock</th><th></th></tr></thead><tbody>` +
     LIB.map((o,i)=>`<tr><td class="num">${esc(o.name)}</td><td>${esc(o.label)}</td>
@@ -999,7 +1013,8 @@ function wireLibDrop(){
   dz.addEventListener("drop",ev=>{
     const f=ev.dataTransfer.files[0]; if(!f) return;
     const r=new FileReader();
-    r.onload=()=>{ try{ const d=JSON.parse(r.result); setLibrary(Array.isArray(d)?d:d.oligos); }
+    r.onload=()=>{ try{ const d=JSON.parse(r.result); setLibrary(Array.isArray(d)?d:d.oligos);
+                     LIB_SOURCE="file"; renderLibrary(); }
                    catch(e){ alert("Could not read that library: "+e.message); } };
     r.readAsText(f);
   });
@@ -1014,7 +1029,7 @@ async function autoLoadLibrary(){
     const r=await fetch("oligos.json",{cache:"no-store"});
     if(!r.ok) return;
     const d=await r.json();
-    setLibrary(Array.isArray(d)?d:d.oligos);
+    setLibrary(Array.isArray(d)?d:d.oligos); LIB_SOURCE="file";
   }catch(e){ /* absent or blocked - expected, not an error */ }
 }
 function usageOf(id){ let n=0; S.plates.forEach(p=>Object.values(p.wells).forEach(w=>{ if(w.oligoId===id) n++; })); return n; }
@@ -1726,10 +1741,39 @@ async function wsDraw(state){
       `</tbody></table></div>`;
 }
 /* The oligo library lives in the data folder, so the whole lab shares one. */
+/* The data folder is authoritative. The localStorage copy is only a cache, so
+   when the folder's oligos.json differs it replaces what is in memory - that is
+   what makes a shared library actually shared. Returns what happened so the UI
+   can say so rather than changing the list silently. */
 async function wsSyncLibrary(){
-  if(!HAS_WS || !WS.connected()) return;
-  const lib = await WS.readLibrary();
-  if(lib && Array.isArray(lib) && lib.length && !LIB.length) setLibrary(lib);
+  if(!HAS_WS || !WS.connected()) return {state:"no-folder"};
+  let lib;
+  try{ lib = await WS.readLibrary(); }catch(e){ return {state:"error", error:e.message}; }
+  if(!lib || !Array.isArray(lib) || !lib.length){
+    LIB_SOURCE = LIB.length ? "browser" : "none";
+    renderLibrary(); return {state:"absent"};
+  }
+  let norm; try{ norm = normaliseLib(lib); }catch(e){ return {state:'error', error:e.message}; }
+  const same = JSON.stringify(norm) === JSON.stringify(LIB);
+  if(!same){
+    const had = LIB.length;
+    setLibrary(lib);
+    LIB_SOURCE = "folder"; renderLibrary();
+    return {state: had ? "replaced" : "loaded", n:lib.length, had};
+  }
+  LIB_SOURCE = "folder"; renderLibrary();
+  return {state:"unchanged", n:lib.length};
+}
+/* Explicit re-read, for when someone else has edited the shared file. */
+async function wsReloadLibrary(){
+  if(!WS.connected()){ alert("No data folder connected."); return; }
+  const r = await wsSyncLibrary();
+  const msg = { loaded:"Loaded "+r.n+" oligos from the folder.",
+                replaced:"Replaced the browser copy with "+r.n+" oligos from the folder.",
+                unchanged:"Already up to date with the folder ("+r.n+" oligos).",
+                absent:"No oligos.json in the data folder.",
+                error:"Could not read the folder: "+r.error }[r.state] || "Nothing to do.";
+  alert(msg);
 }
 async function wsSave(){
   if(!WS.connected()){ alert("Connect a data folder first."); return; }
