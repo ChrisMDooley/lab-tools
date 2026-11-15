@@ -749,8 +749,30 @@ function newExperiment(){
                harvestTime:"", purpose:"", notes:"" },
        settings: defaults(),
        formats: JSON.parse(JSON.stringify(BASE_FORMATS)),
-       cellLines: [ {name:"HEK293T", density:52100,    validated:false},
-                    {name:"HeLa",    density:28906.25, validated:false} ],
+       /* density is cells/cm2 and is DISPLAY ONLY - it does not feed the volume
+          calculations. A line may therefore carry density:null, which means
+          "nobody has recorded one", and that is shown as such rather than
+          filled in with a plausible-looking number. */
+       cellLines: [
+         {name:"HEK293T",             density:52100,    validated:false},
+         {name:"HeLa",                density:28906.25, validated:false},
+         {name:"Human myoblasts Pv16",density:null, validated:false,
+          note:"Primary-like myoblasts: seeding density and whether these are kept "+
+               "proliferating or differentiated to myotubes both change the protocol. "+
+               "Neither is recorded here yet."},
+         {name:"Mouse myoblasts C2C12",density:null, validated:false,
+          note:"Differentiates to myotubes on serum withdrawal, so the medium at "+
+               "transfection is not the medium at seeding. Record which stage is "+
+               "being transfected."},
+         {name:"Cardiomyocytes iPSC", density:null, validated:false,
+          note:"Post-mitotic once differentiated, so the plating density IS the final "+
+               "density - it does not double before transfection. Supplied by the "+
+               "Dierickx lab, whose differentiation batch is worth recording."},
+         {name:"HEK UPF1 degron",     density:null, validated:false,
+          note:"Degron line: UPF1 depletion is induced, so the induction agent, "+
+               "concentration and how long before transfection are experimental "+
+               "variables this planner does not yet capture. NMD is off in the "+
+               "depleted state, which is the whole point - say so in the record."} ],
        oligos: [], plates: [ newPlate(1) ], active:0 };
   sel.clear(); save(); renderAll();
 }
@@ -859,12 +881,18 @@ function renderMeta(){
   g("g_exc").value=s.excessPct; g("g_dead").value=s.deadWells;
   g("g_min").value=s.minPipette; g("g_dec").value=s.decimals; g("g_scope").value=s.numberingScope;
   g("topId").textContent = (m.id||"-") + (m.name? "  ·  "+m.name : "");
-  g("cellNote").innerHTML = S.cellLines.map(c =>
-    `<div class="note ${c.validated?"k":"w"}" style="margin:8px 0 0"><b>${esc(c.name)}</b> &mdash;
-     ${c.density.toLocaleString()} cells/cm&sup2;. ${c.validated ? "Marked validated."
-     : "<b>Unvalidated.</b> " + (c.name==="HeLa"
-        ? "28,906.25 back-solves exactly to 9,250 cells in a 96-well, so it looks derived from a target well count rather than measured."
-        : "Carried over from the workbook without a recorded source.")}</div>`).join("");
+  /* Only the line in use is described, so six lines do not bury the page. */
+  const cl = S.cellLines.find(c=>c.name===m.cellLine) || S.cellLines[0];
+  g("cellNote").innerHTML = !cl ? "" :
+    `<div class="note ${cl.validated?"k":"w"}" style="margin:8px 0 0"><b>${esc(cl.name)}</b> &mdash;
+     ${cl.density==null ? "<b>no seeding density recorded.</b> Add one below when you have a "+
+         "measured figure; nothing here invents one, and the volume calculations do not use it."
+       : cl.density.toLocaleString()+" cells/cm&sup2;."}
+     ${cl.validated ? " Marked validated."
+       : " <b>Unvalidated.</b> " + (cl.note ? esc(cl.note)
+          : cl.name==="HeLa"
+            ? "28,906.25 back-solves exactly to 9,250 cells in a 96-well, so it looks derived from a target well count rather than measured."
+            : "Carried over from the workbook without a recorded source.")}</div>`;
 }
 function bindMeta(){
   const b = (id,k,f) => { const e=document.getElementById(id);
@@ -874,7 +902,7 @@ function bindMeta(){
   b("m_name","name"); b("m_id","id"); b("m_res","researcher"); b("m_date","date");
   b("m_pass","passage"); b("m_seedD","seedDate"); b("m_txD","txDate");
   b("m_hvD","harvestDate"); b("m_hvT","harvestTime"); b("m_purp","purpose"); b("m_notes","notes");
-  document.getElementById("m_cell").addEventListener("change",e=>{ S.meta.cellLine=e.target.value; save(); });
+  document.getElementById("m_cell").addEventListener("change",e=>{ S.meta.cellLine=e.target.value; save(); renderMeta(); });
   const sb = (id,k,num) => document.getElementById(id).addEventListener("input",e=>{
     S.settings[k] = num ? (parseFloat(e.target.value)||0) : e.target.value;
     save(); renderCalc(); renderMixes(); renderStats(); });
@@ -884,9 +912,11 @@ function bindMeta(){
 function addCellLine(){
   const n = document.getElementById("m_newCell").value.trim();
   const d = parseFloat(document.getElementById("m_newDens").value);
-  if(!n || !(d>0)) { alert("Give the line a name and a density in cells/cm²."); return; }
+  if(!n){ alert("Give the line a name."); return; }
+  const blank = document.getElementById("m_newDens").value.trim() === "";
+  if(!blank && !(d>0)){ alert("Density must be a positive number, or left empty if none is recorded."); return; }
   if(S.cellLines.some(c=>c.name.toLowerCase()===n.toLowerCase())){ alert("That line already exists."); return; }
-  S.cellLines.push({name:n, density:d, validated:true});
+  S.cellLines.push({name:n, density:blank?null:d, validated:!blank});
   document.getElementById("m_newCell").value=""; document.getElementById("m_newDens").value="";
   save(); renderMeta(); renderPlateProps();
 }
