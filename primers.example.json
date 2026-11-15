@@ -1,0 +1,16 @@
+[
+ {
+  "id": "CDBN_1",
+  "seq": "ACGTACGTACGTACGTACGT",
+  "gene": "EXAMPLE",
+  "geneId": "0000",
+  "exon": "1",
+  "type": "qPCR",
+  "notes": "example entry - the real registry is primers.json, untracked",
+  "pair": "CDBN_2",
+  "description": "EXAMPLE_fwd",
+  "stockLocation": "",
+  "dilutionLocation": "",
+  "sheet": "Sheet1"
+ }
+]

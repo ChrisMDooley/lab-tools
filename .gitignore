@@ -14,3 +14,4 @@ experiments/
 # OS noise
 .DS_Store
 Thumbs.db
+primers.json
