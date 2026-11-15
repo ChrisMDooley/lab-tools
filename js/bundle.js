@@ -6,12 +6,23 @@
    bundle has to be readable in ten years without this code:
 
      experiments/<ID>/
-       experiment.json      the record itself
+       transfection.json    the plan: doses, volumes, cells
+       plate.json           the plate layout sent to the instrument
+       qpcr/run-1.json      an analysis run; a later re-run is run-2, not an edit
        manifest.json        SHA-256 of every file, so corruption is visible
        raw/                 instrument files exactly as they came off the machine
        figures/             generated output
        exports/             what was sent elsewhere, e.g. to the ELN
        .lock.json           present only while someone has it open
+
+   One experiment is one folder, and stages ACCUMULATE in it. A qPCR run three
+   weeks later must not rewrite the transfection record it was based on, so
+   each stage is its own file and nothing is ever overwritten in place. That is
+   what keeps the chain intact: these cells got this dose, went in these wells,
+   gave these Cq values.
+
+   experiment.json is the older single-record shape. It is still read, so
+   folders written before this change keep working.
 
    Written against the VFS interface, never the browser API, so all of this is
    exercised by the test suite against an in-memory filesystem.
@@ -40,6 +51,56 @@ var BUNDLE = (function(){
   const dir = id => ROOT + "/" + id;
   const idOf = name => String(name).replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "") || "experiment";
 
+  /* ---- records -----------------------------------------------------------
+     A record is one stage, at a known path inside the folder. Writing one
+     leaves every other file alone and then rebuilds the manifest from what is
+     actually on disk, so the checksums can never drift from reality. */
+  const LEGACY = "experiment.json";
+
+  async function putRecord(vfs, id, relPath, record, opts){
+    const o = Object.assign({ extras:[], appVersion:"" }, opts||{});
+    const base = dir(id);
+    await VFS.writeJSON(vfs, base + "/" + relPath, record);
+    for(const f of o.extras) await vfs.writeFile(base + "/" + f.path, f.data);
+    return { id, path:relPath, manifest: await remanifest(vfs, id, o.appVersion) };
+  }
+
+  /* Next free qpcr/run-N.json, so a re-run never lands on an earlier one. */
+  async function nextRun(vfs, id, prefix){
+    const p = prefix || "qpcr/run";
+    const d = p.split("/").slice(0,-1).join("/");
+    const stem = p.split("/").pop();
+    let files = [];
+    try{ files = (await vfs.listDir(dir(id) + (d ? "/" + d : ""))).map(e=>e.name); }catch(e){}
+    const re = new RegExp("^" + stem.replace(/[.*+?^${}()|[\]\\]/g,"\\$&") + "-(\\d+)\\.json$");
+    const n = files.reduce((m,f)=>{ const x=re.exec(f); return x ? Math.max(m, +x[1]) : m; }, 0);
+    return p + "-" + (n+1) + ".json";
+  }
+
+  /* Every record in the folder, newest shape and legacy alike. */
+  async function records(vfs, id){
+    const base = dir(id), out = [];
+    const paths = [];
+    await walk(vfs, base, "", paths);
+    for(const rel of paths.sort()){
+      if(rel === "manifest.json" || rel === ".lock.json") continue;
+      if(!/\.json$/.test(rel)) continue;
+      if(/^(raw|figures|exports)\//.test(rel)) continue;
+      try{
+        const r = await VFS.readJSON(vfs, base + "/" + rel);
+        out.push({ path:rel, kind: r.kind || (rel === LEGACY ? "experiment" : rel.replace(/\.json$/,"")),
+                   record:r });
+      }catch(e){ out.push({ path:rel, error:String(e.message||e) }); }
+    }
+    /* Workflow order, not alphabetical: a folder should read in the order the
+       work happened, so "transfection, plate, qpcr, qpcr" rather than
+       "plate, qpcr, qpcr, transfection". Anything unrecognised sorts last. */
+    const ORDER = ["experiment","transfection","plate","qpcr"];
+    const rank = r => { const i = ORDER.indexOf(String(r.kind).split("/")[0]);
+                        return i < 0 ? ORDER.length : i; };
+    return out.sort((a,b)=> rank(a)-rank(b) || a.path.localeCompare(b.path));
+  }
+
   /* ---- listing ----------------------------------------------------------- */
   async function list(vfs){
     const out = [];
@@ -47,10 +108,16 @@ var BUNDLE = (function(){
       if(e.kind !== "directory") continue;
       const rec = { id:e.name, name:e.name, modified:null, ok:null, locked:false };
       try{
-        const x = await VFS.readJSON(vfs, dir(e.name) + "/experiment.json");
+        const all = await records(vfs, e.name);
+        rec.stages = all.map(r=>r.kind);
+        const main = all.find(r=>r.kind==="transfection") ||
+                     all.find(r=>r.kind==="experiment") || all[0];
+        const x = (main && main.record) || {};
         rec.name = (x.meta && x.meta.name) || e.name;
         rec.researcher = x.meta && x.meta.researcher;
         rec.kind = x.kind || "experiment";
+        rec.runs = all.filter(r=>/^qpcr\//.test(r.path)).length;
+        if(!all.length) rec.unreadable = "no records in this folder";
       }catch(err){ rec.unreadable = String(err.message || err); }
       try{
         const m = await VFS.readJSON(vfs, dir(e.name) + "/manifest.json");
@@ -72,21 +139,22 @@ var BUNDLE = (function(){
     const base = dir(id);
     await VFS.writeJSON(vfs, base + "/experiment.json", experiment);
     for(const f of o.extras) await vfs.writeFile(base + "/" + f.path, f.data);
-    const files = [];
+    return { id, manifest: await remanifest(vfs, id, o.appVersion) };
+  }
+
+  /* Rebuilt from what is on disk, never from what we meant to write. */
+  async function remanifest(vfs, id, appVersion){
+    const base = dir(id), files = [];
     await walk(vfs, base, "", files);
-    const manifest = {
-      format: FORMAT, id,
-      written: new Date().toISOString(),
-      appVersion: o.appVersion || "",
-      files: []
-    };
+    const manifest = { format: FORMAT, id, written: new Date().toISOString(),
+                       appVersion: appVersion || "", files: [] };
     for(const rel of files.sort()){
       if(rel === "manifest.json" || rel === ".lock.json") continue;
       const bytes = await vfs.readFile(base + "/" + rel);
       manifest.files.push({ path:rel, bytes:bytes.length, sha256:await sha256(bytes) });
     }
     await VFS.writeJSON(vfs, base + "/manifest.json", manifest);
-    return { id, manifest };
+    return manifest;
   }
   async function walk(vfs, base, rel, out){
     for(const e of await vfs.listDir(rel ? base + "/" + rel : base)){
@@ -99,11 +167,16 @@ var BUNDLE = (function(){
   /* ---- reading and verifying --------------------------------------------- */
   async function load(vfs, id){
     const base = dir(id);
-    const experiment = await VFS.readJSON(vfs, base + "/experiment.json");
+    const all = await records(vfs, id);
+    const pick = k => (all.find(r=>r.kind===k)||{}).record || null;
+    const experiment = pick("transfection") || pick("experiment") ||
+                       (all[0] && all[0].record) || {};
     let manifest = null, verification = { checked:false };
     try{ manifest = await VFS.readJSON(vfs, base + "/manifest.json"); }catch(e){}
     if(manifest) verification = await verify(vfs, id, manifest);
-    return { id, experiment, manifest, verification };
+    return { id, experiment, records:all, manifest, verification,
+             plate:(all.find(r=>r.kind==="plate")||{}).record || null,
+             qpcr: all.filter(r=>/^qpcr\//.test(r.path)).map(r=>r.record) };
   }
 
   /* Recompute every hash. A bundle that has been edited outside the app, or
@@ -172,8 +245,9 @@ var BUNDLE = (function(){
     await vfs.writeFile(dir(id) + "/" + relPath, data);
   }
 
-  return { FORMAT, ROOT, LOCK_STALE_MS, sha256, idOf, dir,
+  return { FORMAT, ROOT, LOCK_STALE_MS, LEGACY, sha256, idOf, dir,
            list, save, load, verify, lock, unlock, lockState,
+           putRecord, nextRun, records, remanifest,
            exportBundle, addFile };
 })();
 if (typeof module !== "undefined") module.exports = BUNDLE;
