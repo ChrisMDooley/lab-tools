@@ -241,6 +241,7 @@ code{font-family:var(--mono);font-size:11.5px;background:#f0efec;padding:1px 4px
             <button onclick="addCellLine()">Add</button></div></label>
       </div>
       <div id="cellNote"></div>
+      <div id="cellFields"></div>
     </div></div>
 
     <div class="panel"><div class="t">Purpose and method</div><div class="b">
@@ -746,6 +747,12 @@ function newExperiment(){
   S = { meta:{ name:"", id:"EXP-"+new Date().toISOString().slice(0,10).replace(/-/g,""),
                researcher:"", date:new Date().toISOString().slice(0,10),
                cellLine:"HeLa", passage:"", seedDate:"", txDate:"", harvestDate:"",
+               /* Only meaningful for lines that declare them (see cellLines.fields).
+                  Kept on meta rather than on the line itself: the line is a
+                  catalogue entry, these are what was done in THIS experiment. */
+               stage:"", stageNote:"",
+               degron:{ system:"", agent:"", conc:"", concUnit:"\u00b5M",
+                        lead:"", leadUnit:"h", washout:"" },
                harvestTime:"", purpose:"", notes:"" },
        settings: defaults(),
        formats: JSON.parse(JSON.stringify(BASE_FORMATS)),
@@ -756,11 +763,11 @@ function newExperiment(){
        cellLines: [
          {name:"HEK293T",             density:52100,    validated:false},
          {name:"HeLa",                density:28906.25, validated:false},
-         {name:"Human myoblasts Pv16",density:null, validated:false,
+         {name:"Human myoblasts Pv16",density:null, validated:false, fields:["stage"],
           note:"Primary-like myoblasts: seeding density and whether these are kept "+
                "proliferating or differentiated to myotubes both change the protocol. "+
                "Neither is recorded here yet."},
-         {name:"Mouse myoblasts C2C12",density:null, validated:false,
+         {name:"Mouse myoblasts C2C12",density:null, validated:false, fields:["stage"],
           note:"Differentiates to myotubes on serum withdrawal, so the medium at "+
                "transfection is not the medium at seeding. Record which stage is "+
                "being transfected."},
@@ -768,7 +775,7 @@ function newExperiment(){
           note:"Post-mitotic once differentiated, so the plating density IS the final "+
                "density - it does not double before transfection. Supplied by the "+
                "Dierickx lab, whose differentiation batch is worth recording."},
-         {name:"HEK UPF1 degron",     density:null, validated:false,
+         {name:"HEK UPF1 degron",     density:null, validated:false, fields:["degron"],
           note:"Degron line: UPF1 depletion is induced, so the induction agent, "+
                "concentration and how long before transfection are experimental "+
                "variables this planner does not yet capture. NMD is off in the "+
@@ -819,7 +826,29 @@ function save(){ try{ localStorage.setItem(LS, JSON.stringify(S)); }catch(e){} }
 function load(){
   try{ const r = localStorage.getItem(LS); if(!r) return false;
        const o = JSON.parse(r); if(!o || !o.plates) return false; S = o;
-       S.settings = Object.assign(defaults(), S.settings||{}); return true;
+       S.settings = Object.assign(defaults(), S.settings||{});
+       /* A plan saved before a new catalogue entry existed must still gain it,
+          or the browser copy silently freezes the cell lines at whatever they
+          were the day it was saved. Merge by name: anything the user added
+          stays, anything new in the defaults is appended, and a line the user
+          has edited is left exactly as they edited it. */
+       newExperiment();                 // sets S to a pristine default
+       const fresh = S; S = o;          // keep it as the reference, restore the saved plan
+       S.cellLines = S.cellLines || [];
+       for(const d of fresh.cellLines)
+         if(!S.cellLines.some(c=>c.name.toLowerCase()===d.name.toLowerCase()))
+           S.cellLines.push(d);
+         else { const mine = S.cellLines.find(c=>c.name.toLowerCase()===d.name.toLowerCase());
+                if(d.fields && !mine.fields) mine.fields = d.fields;   // new field needs
+                if(d.note  && !mine.note)    mine.note  = d.note; }
+       /* Same reasoning for plate formats: a saved plan must not be left with
+          a format list that no longer contains what the plates reference. */
+       if(!Array.isArray(S.formats) || !S.formats.length) S.formats = fresh.formats;
+       else for(const d of fresh.formats)
+         if(!S.formats.some(f=>f.name===d.name)) S.formats.push(d);
+       S.meta = Object.assign({}, fresh.meta, S.meta||{});
+       S.meta.degron = Object.assign({}, fresh.meta.degron, S.meta.degron||{});
+       return true;
   }catch(e){ return false; }
 }
 const plate = () => S.plates[S.active];
@@ -893,6 +922,85 @@ function renderMeta(){
           : cl.name==="HeLa"
             ? "28,906.25 back-solves exactly to 9,250 cells in a 96-well, so it looks derived from a target well count rather than measured."
             : "Carried over from the workbook without a recorded source.")}</div>`;
+  renderCellFields(cl);
+}
+
+/* Extra fields a particular cell line needs. Declared per line rather than
+   hard-coded, so another degron or myoblast line only sets fields:[...].
+   Nothing here is pre-filled with a plausible default: an induction agent or
+   a differentiation day that nobody typed is a fabricated experimental
+   parameter, and these end up in the saved record. */
+function renderCellFields(cl){
+  const host = document.getElementById("cellFields");
+  if(!host) return;
+  const f = (cl && cl.fields) || [];
+  if(!f.length){ host.innerHTML = ""; return; }
+  const m = S.meta, d = m.degron || (m.degron = {});
+  const sel = (v,opts) => opts.map(o =>
+    `<option value="${esc(o[0])}" ${o[0]===v?"selected":""}>${esc(o[1])}</option>`).join("");
+  let h = "";
+
+  if(f.includes("stage")){
+    h += `<div class="panel" style="margin-top:11px"><div class="t">Differentiation state</div>
+      <div class="b"><div class="grid g2">
+      <label><i>Transfected as</i><select id="cf_stage">${sel(m.stage||"",[
+        ["","- not recorded -"],
+        ["proliferating","Proliferating myoblasts"],
+        ["differentiating","Differentiating (serum withdrawn)"],
+        ["myotubes","Differentiated myotubes"]])}</select></label>
+      <label><i>Day of differentiation, or other detail</i>
+        <input id="cf_stageNote" value="${esc(m.stageNote||"")}" placeholder="e.g. D3 post serum withdrawal"></label>
+      </div>
+      <div class="note w" style="margin-top:10px">Myoblasts and myotubes are not transfected in the
+        same medium, and serum withdrawal changes both the cell number and the transfection
+        efficiency. The planner does not adjust any volume for this &mdash; it records which state
+        you used so the number means something later.</div>
+      </div></div>`;
+  }
+
+  if(f.includes("degron")){
+    h += `<div class="panel" style="margin-top:11px"><div class="t">Degron induction</div>
+      <div class="b"><div class="grid g2">
+      <label><i>Degron system</i><select id="cf_dsys">${sel(d.system||"",[
+        ["","- not recorded -"],["AID","AID / auxin-inducible"],
+        ["dTAG","dTAG (FKBP12&#8203;F36V)"],["SMASh","SMASh"],["other","Other"]])}</select></label>
+      <label><i>Inducing agent</i><input id="cf_dagent" value="${esc(d.agent||"")}"
+        list="degronAgents" placeholder="as used, e.g. 5-Ph-IAA"></label>
+      <label><i>Concentration</i><div class="btns">
+        <input id="cf_dconc" type="number" step="any" value="${esc(d.conc||"")}" style="flex:1">
+        <select id="cf_dcu" style="width:92px">${sel(d.concUnit||"\u00b5M",
+          [["\u00b5M","\u00b5M"],["nM","nM"],["mM","mM"],["\u00b5g/mL","\u00b5g/mL"]])}</select>
+      </div></label>
+      <label><i>Added before transfection</i><div class="btns">
+        <input id="cf_dlead" type="number" step="any" value="${esc(d.lead||"")}" style="flex:1">
+        <select id="cf_dlu" style="width:92px">${sel(d.leadUnit||"h",
+          [["h","hours"],["min","minutes"],["d","days"]])}</select>
+      </div></label>
+      <label style="grid-column:1/-1"><i>Washout or maintenance during the experiment</i>
+        <input id="cf_dwash" value="${esc(d.washout||"")}"
+          placeholder="e.g. maintained in medium until harvest"></label>
+      </div>
+      <datalist id="degronAgents"><option value="5-Ph-IAA"><option value="IAA (auxin)">
+        <option value="dTAG-13"><option value="dTAGV-1"><option value="ASV"></datalist>
+      <div class="note w" style="margin-top:10px">UPF1 depletion switches NMD off, which is the
+        point of the line and also the thing that makes its numbers incomparable with an
+        NMD-competent control. Record the agent and timing here; nothing is assumed, and the
+        suggestions in the agent box are common choices, not what your line uses.</div>
+      </div></div>`;
+  }
+  host.innerHTML = h;
+
+  const on = (id,fn) => { const e=document.getElementById(id);
+    if(e) e.addEventListener(e.tagName==="SELECT"?"change":"input", ()=>{ fn(e.value); save(); }); };
+  on("cf_stage",     v=>{ S.meta.stage=v; });
+  on("cf_stageNote", v=>{ S.meta.stageNote=v; });
+  on("cf_dsys",   v=>{ S.meta.degron.system=v; });
+  on("cf_dagent", v=>{ S.meta.degron.agent=v; });
+  on("cf_dconc",  v=>{ S.meta.degron.conc=v; });
+  on("cf_dcu",    v=>{ S.meta.degron.concUnit=v; });
+  on("cf_dlead",  v=>{ S.meta.degron.lead=v; });
+  on("cf_dlu",    v=>{ S.meta.degron.leadUnit=v; });
+  on("cf_dwash",  v=>{ S.meta.degron.washout=v; });
 }
 function bindMeta(){
   const b = (id,k,f) => { const e=document.getElementById(id);
