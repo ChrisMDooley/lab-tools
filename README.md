@@ -2,6 +2,15 @@
 
 Browser tools for this lab's transfection and qPCR work. No install, no server, no network.
 
+**Picking this up after a break, or handing it to someone else?** Read
+[`docs/STATE.md`](docs/STATE.md) first: what works, what is built but not yet
+wired in, the decisions already taken, and the disclosure rule for this repo.
+
+```
+node tests/run.js      # 59 checks, no browser
+node tests/pages.js    # each page's own self-tests, headless
+```
+
 | Page | What it does |
 |---|---|
 | `index.html` | **Transfection planner** - experiment setup, plate designer, dilution arithmetic, master mixes derived from the layout |
